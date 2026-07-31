@@ -1395,6 +1395,10 @@ panel_list() {
         name=$(basename "$f" .toml)
         [[ "$name" =~ ^(iran|kharej)([0-9]+)$ ]] || continue
         typ="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+        # transport + (client's) remote let the panel auto-discover tunnels across nodes
+        local transport remote
+        transport=$(awk -F'"' '/^type = /{print $2; exit}' "$f" 2>/dev/null)
+        remote=""; [[ "$typ" == kharej ]] && remote=$(awk -F'"' '/^remote_addr = /{print $2; exit}' "$f" 2>/dev/null)
         systemctl is-active --quiet "leech-${name}" && active=true || active=false
         transport=$(grep -oP 'type\s*=\s*"\K[^"]+' "$f" | head -1)
         token=$(grep -oP 'token\s*=\s*"\K[^"]+' "$f" | head -1)
@@ -1420,12 +1424,16 @@ panel_stats() {
     [[ -x "${config_dir}/leech" ]] && cver=$("${config_dir}/leech" -v 2>/dev/null | head -1 | tr -d '"\\')
     printf '{"host":{"cpu_total":%s,"cpu_idle":%s,"mem_used":%s,"mem_total":%s,"rx_bytes":%s,"tx_bytes":%s,"uptime":%s,"ncpu":%s,"core":"%s"},"tunnels":[' \
         "${cput:-0}" "${cpui:-0}" "${memu:-0}" "${memt:-0}" "${hrx:-0}" "${htx:-0}" "${upt:-0}" "${ncpu:-1}" "${cver}"
-    local first=1 f name typ port active pid mem cpuns rx tx conns dir
+    local first=1 f name typ port active pid mem cpuns rx tx conns dir transport remote
     for f in "${config_dir}"/{iran,kharej}*.toml; do
         [ -f "$f" ] || continue
         name=$(basename "$f" .toml)
         [[ "$name" =~ ^(iran|kharej)([0-9]+)$ ]] || continue
         typ="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+        # transport + (client's) remote let the panel auto-discover tunnels across nodes
+        # and detect a re-tunnel to a different server made outside the panel.
+        transport=$(awk -F'"' '/^type = /{print $2; exit}' "$f" 2>/dev/null)
+        remote=""; [[ "$typ" == kharej ]] && remote=$(awk -F'"' '/^remote_addr = /{print $2; exit}' "$f" 2>/dev/null)
         systemctl is-active --quiet "leech-${name}" && active=true || active=false
         mem=$(systemctl show "leech-${name}" -p MemoryCurrent --value 2>/dev/null)
         cpuns=$(systemctl show "leech-${name}" -p CPUUsageNSec --value 2>/dev/null)
@@ -1457,8 +1465,8 @@ panel_stats() {
         conns=$(ss -Htn "$dir = :$port" 2>/dev/null | grep -c ESTAB)
         [[ "${conns:-0}" -eq 0 ]] && [[ -n "$(ss -Huan "$dir = :$port" 2>/dev/null)" ]] && conns=1
         [ $first -eq 1 ] || printf ','; first=0
-        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s}' \
-            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}"
+        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s,"transport":"%s","remote":"%s"}' \
+            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}" "${transport}" "${remote}"
     done
     printf ']}\n'
 }
