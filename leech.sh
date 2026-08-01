@@ -1254,6 +1254,12 @@ connect_to_panel() {
     # "(default: )" tail that say nothing, which is what made this screen unreadable.
     echo -ne "\033[36m 1. Panel URL   \033[0m> "
     IFS=$' \t\r\n' read -r url _
+    # Normalise what was typed. A trailing slash is the common one and it used to break
+    # enrollment outright: "$url/api/enroll" became "//api/enroll", which the panel answers
+    # with a 301 and an EMPTY body, so the script saw no JSON and blamed the address.
+    # A missing scheme is the other one — curl cannot use a bare host:port.
+    while [ -n "$url" ] && [ "${url%/}" != "$url" ]; do url="${url%/}"; done
+    case "$url" in http://*|https://*|"") ;; *) url="http://$url" ;; esac
 
     # ---- manual fallback: no URL, just paste the panel's SSH public key directly ----
     if [ -z "$url" ]; then
@@ -1288,15 +1294,26 @@ connect_to_panel() {
         fi
     fi
 
-    resp=$(curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
-           -d "{\"token\":\"$token\"}" "$url/api/enroll")
+    # Capture the HTTP status alongside the body, so a non-JSON reply (redirect, proxy
+    # error page, wrong port answering) can be reported as what it actually was instead of
+    # being flattened into "no response".
+    local raw code err
+    raw=$(curl -s -w $'\n%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' \
+          -d "{\"token\":\"$token\"}" "$url/api/enroll")
+    code="${raw##*$'\n'}"
+    resp="${raw%$'\n'*}"
     if ! echo "$resp" | grep -q '"ok":true'; then
-        local err
         # strip backslashes: the panel escapes quotes inside its message, and a trailing
         # backslash would swallow the colour reset in colorize (echo -e) and stain the
         # rest of the screen red.
         err=$(echo "$resp" | grep -oP '"error":"\K[^"]+' | tr -d '\\')
-        [ -z "$err" ] && err="no response from $url (wrong address/port, or blocked)"
+        if [ -z "$err" ]; then
+            case "$code" in
+                000|"") err="could not reach $url — check the address, the port, and that the panel is running" ;;
+                3*)     err="$url answered HTTP $code (a redirect) — check the address has no extra path" ;;
+                *)      err="$url answered HTTP $code but not with a panel reply — is that really the panel port?" ;;
+            esac
+        fi
         colorize red "Enrollment failed: $err"
         colorize yellow "Add this node in the panel (Nodes → Enroll node) and paste its exact token."
         press_key; return
