@@ -731,6 +731,11 @@ gen_noninteractive() {
     CONFIG[obfs_junk_count]="${BH_JUNK_COUNT}"
     [[ "${BH_TYPE:-tcp}" =~ ^(tcp|tcpmux|tun)$ ]] && CONFIG[obfs_junk_count]="${BH_JUNK_COUNT:-0}"
     CONFIG[obfs_junk_min]="${BH_JUNK_MIN}"; CONFIG[obfs_junk_max]="${BH_JUNK_MAX}"
+    # the interactive path hardcodes junk min/max = 40/1000 whenever junk is ON (line ~661);
+    # mirror it so a panel tunnel with junk>0 carries the same range instead of omitting it.
+    if [[ -n "${CONFIG[obfs_junk_count]}" && "${CONFIG[obfs_junk_count]}" != "0" ]]; then
+        CONFIG[obfs_junk_min]="${BH_JUNK_MIN:-40}"; CONFIG[obfs_junk_max]="${BH_JUNK_MAX:-1000}"
+    fi
     # adaptive is a client-side prompt, written even when off
     CONFIG[adaptive]="${BH_ADAPTIVE}"
     [[ "$mode" == "client" ]] && CONFIG[adaptive]="${BH_ADAPTIVE:-false}"
