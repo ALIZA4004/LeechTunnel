@@ -1245,15 +1245,21 @@ authorize_panel_key() { # $1 = pubkey line
 }
 
 connect_to_panel() {
-    clear; colorize cyan "Connect this server to a LEECH panel (enroll as a node)" bold; echo
+    clear; colorize cyan "Connect this server to a LEECH panel (enroll as a node)" bold
+    colorize yellow "Both values are on this server's card in the panel."; echo
     local pairfile="/etc/leech/panel.pair"
     local url token name resp pubkey stored_url stored_tok
-    prompt_with_default "Panel URL (http://IP:PORT)  [empty = paste SSH key manually]" "" url
+    # Two questions, one per line, each naming exactly what to paste. The generic
+    # prompt_with_default helper is NOT used here: it prints a "[-]" prefix and a
+    # "(default: )" tail that say nothing, which is what made this screen unreadable.
+    echo -ne "\033[36m 1. Panel URL   \033[0m> "
+    IFS=$' \t\r\n' read -r url _
 
     # ---- manual fallback: no URL, just paste the panel's SSH public key directly ----
     if [ -z "$url" ]; then
-        colorize yellow "Paste the panel's SSH public key, then Enter:"
+        colorize yellow "No URL given — paste the panel's SSH public key instead, then Enter:"
         local pubkey2; read -r pubkey2
+        pubkey2="${pubkey2%$'\r'}"
         if authorize_panel_key "$pubkey2"; then
             colorize green "✔ Panel key authorized — the panel can now control this node over SSH."
         else
@@ -1266,7 +1272,8 @@ connect_to_panel() {
     # ---- token flow: paste the per-node token shown on the panel's node card ----
     # The token is the whole credential — the panel admin password is deliberately NOT
     # asked for, so it never travels from here to the panel in the clear.
-    read -r -p "Enrollment token (copy it from the node's card in the panel): " token
+    echo -ne "\033[36m 2. Node token  \033[0m> "
+    IFS=$' \t\r\n' read -r token _
     [ -z "$token" ] && { colorize red "token is required"; press_key; return; }
 
     # pairing lock: once paired, refuse to enroll into a *different* panel/token so no
@@ -1284,7 +1291,13 @@ connect_to_panel() {
     resp=$(curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
            -d "{\"token\":\"$token\"}" "$url/api/enroll")
     if ! echo "$resp" | grep -q '"ok":true'; then
-        colorize red "enrollment failed: $(echo "$resp" | grep -oP '"error":"\K[^"]+')"
+        local err
+        # strip backslashes: the panel escapes quotes inside its message, and a trailing
+        # backslash would swallow the colour reset in colorize (echo -e) and stain the
+        # rest of the screen red.
+        err=$(echo "$resp" | grep -oP '"error":"\K[^"]+' | tr -d '\\')
+        [ -z "$err" ] && err="no response from $url (wrong address/port, or blocked)"
+        colorize red "Enrollment failed: $err"
         colorize yellow "Add this node in the panel (Nodes → Enroll node) and paste its exact token."
         press_key; return
     fi
