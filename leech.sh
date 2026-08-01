@@ -705,8 +705,8 @@ gen_noninteractive() {
     CONFIG[congestion]="${BH_CONGESTION-bbr}"
     CONFIG[obfuscation]="${BH_OBFS-}"
     CONFIG[mux_version]="${BH_MUX_VERSION:-2}"
-    CONFIG[mux_framesize]="32768"; CONFIG[mux_recievebuffer]="4194304"
-    CONFIG[mux_streambuffer]="2097152"; CONFIG[mux_concurrency]="${BH_MUX_CONC:-8}"
+    CONFIG[mux_framesize]="${BH_MUX_FRAME:-32768}"; CONFIG[mux_recievebuffer]="${BH_MUX_RCVBUF:-4194304}"
+    CONFIG[mux_streambuffer]="${BH_MUX_STREAMBUF:-2097152}"; CONFIG[mux_concurrency]="${BH_MUX_CONC:-8}"
     # anytls is the one transport the interactive path asks an SNI for (and so always
     # writes); the others take the core's own default unless one is given
     if [[ "${BH_TYPE}" == "anytls" ]]; then CONFIG[tls_sni]="${BH_SNI:-www.digikala.com}"; else CONFIG[tls_sni]="${BH_SNI}"; fi
