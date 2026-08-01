@@ -1227,8 +1227,9 @@ EOF
     fi
     echo
     colorize cyan "To add a node: in the panel open Nodes → Enroll, fill name + IP, and copy the"
-    colorize cyan "per-node token it shows. On the node run this script → 'Connect to panel', paste"
-    colorize cyan "the token with the panel URL + admin password — the node authorizes itself."
+    colorize cyan "per-node token it shows. On the node run this script → 'Connect to panel' and"
+    colorize cyan "paste the token with this panel's URL — the node authorizes itself. The token is"
+    colorize cyan "single-use and only valid from that node's own IP; no password is ever sent."
     echo
     colorize yellow "Manual fallback — the panel's SSH public key (only needed if you skip the token flow):"
     cat /etc/leech-panel/id_ed25519.pub
@@ -1246,7 +1247,7 @@ authorize_panel_key() { # $1 = pubkey line
 connect_to_panel() {
     clear; colorize cyan "Connect this server to a LEECH panel (enroll as a node)" bold; echo
     local pairfile="/etc/leech/panel.pair"
-    local url token pw role name myip tok resp pubkey stored_url stored_tok
+    local url token name resp pubkey stored_url stored_tok
     prompt_with_default "Panel URL (http://IP:PORT)  [empty = paste SSH key manually]" "" url
 
     # ---- manual fallback: no URL, just paste the panel's SSH public key directly ----
@@ -1263,6 +1264,8 @@ connect_to_panel() {
     fi
 
     # ---- token flow: paste the per-node token shown on the panel's node card ----
+    # The token is the whole credential — the panel admin password is deliberately NOT
+    # asked for, so it never travels from here to the panel in the clear.
     read -r -p "Enrollment token (copy it from the node's card in the panel): " token
     [ -z "$token" ] && { colorize red "token is required"; press_key; return; }
 
@@ -1278,26 +1281,19 @@ connect_to_panel() {
         fi
     fi
 
-    read -rsp "Panel admin password: " pw; echo
-    prompt_with_default "This node's role (iran/kharej/both)" "kharej" role
-    name=$(hostname); myip=$(hostname -I | awk '{print $1}')
-
-    tok=$(curl -s --max-time 8 -X POST -H 'Content-Type: application/json' \
-          -d "{\"password\":\"$pw\"}" "$url/api/login" | grep -oP '"token":"\K[^"]+')
-    [ -z "$tok" ] && { colorize red "could not log in to the panel (check URL / password)"; press_key; return; }
-
-    resp=$(curl -s --max-time 8 -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
-           -d "{\"token\":\"$token\",\"host\":\"$myip\"}" "$url/api/enroll")
+    resp=$(curl -s --max-time 10 -X POST -H 'Content-Type: application/json' \
+           -d "{\"token\":\"$token\"}" "$url/api/enroll")
     if ! echo "$resp" | grep -q '"ok":true'; then
         colorize red "enrollment failed: $(echo "$resp" | grep -oP '"error":"\K[^"]+')"
-        colorize yellow "Create this node in the panel (Nodes → Enroll) and paste its exact token."
+        colorize yellow "Add this node in the panel (Nodes → Enroll node) and paste its exact token."
         press_key; return
     fi
 
+    name=$(echo "$resp" | grep -oP '"name":"\K[^"]+')
     pubkey=$(echo "$resp" | grep -oP '"pubkey":"\K[^"]+')
     if authorize_panel_key "$pubkey"; then
         mkdir -p /etc/leech; printf '%s %s\n' "$url" "$token" > "$pairfile"; chmod 600 "$pairfile"
-        colorize green "✔ Paired with the panel and authorized — it now controls this node as '$name' ($role @ $myip)."
+        colorize green "✔ Paired with the panel and authorized — it now controls this node as '$name'."
     else
         colorize red "the panel did not return its SSH key — enrollment incomplete."
     fi
