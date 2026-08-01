@@ -529,6 +529,11 @@ generate_toml_config() {
         [[ -n "${CONFIG[adaptive]}" ]]          && echo "adaptive = ${CONFIG[adaptive]}"
         [[ -n "${CONFIG[adaptive_failures]}" ]] && echo "adaptive_failures = ${CONFIG[adaptive_failures]}"
         [[ -n "${CONFIG[adaptive_carriers]}" ]] && echo "adaptive_carriers = ${CONFIG[adaptive_carriers]}"
+        # ENHANCEMENT — active pre-probe: check the live carrier out-of-band and switch BEFORE
+        # user traffic drops (empty => key omitted => reactive-only, faithful default).
+        [[ -n "${CONFIG[adaptive_probe]}" ]]          && echo "adaptive_probe = ${CONFIG[adaptive_probe]}"
+        [[ -n "${CONFIG[adaptive_probe_interval]}" ]] && echo "adaptive_probe_interval = ${CONFIG[adaptive_probe_interval]}"
+        [[ -n "${CONFIG[adaptive_probe_fails]}" ]]    && echo "adaptive_probe_fails = ${CONFIG[adaptive_probe_fails]}"
         echo ""
         if [[ "$is_tun" == "true" ]]; then
             echo "[tun]"
@@ -671,6 +676,13 @@ prompt_dpi_section() {
             prompt_with_default "  ↳ Carriers (comma-sep 'type@host:port')" "" CONFIG[dpi_adaptive_raw]
             CONFIG[adaptive_carriers]="$(csv_to_toml_array "${CONFIG[dpi_adaptive_raw]}")"
             prompt_with_default "  ↳ Consecutive failures before switching" "3" CONFIG[adaptive_failures]
+            # ENHANCEMENT — active pre-probe: an out-of-band check of the live carrier that
+            # switches BEFORE user traffic drops (vs waiting for the data path to fail).
+            prompt_boolean "  ↳ Active pre-probe (switch early on an out-of-band block)" "true" CONFIG[adaptive_probe]
+            if [[ "${CONFIG[adaptive_probe]}" == "true" ]]; then
+                prompt_with_default "    ↳ Probe interval seconds (how often to check the carrier)" "20" CONFIG[adaptive_probe_interval]
+                prompt_with_default "    ↳ Consecutive probe failures before switching early" "2" CONFIG[adaptive_probe_fails]
+            fi
         fi
     fi
     echo ""
@@ -740,6 +752,8 @@ gen_noninteractive() {
     CONFIG[adaptive]="${BH_ADAPTIVE}"
     [[ "$mode" == "client" ]] && CONFIG[adaptive]="${BH_ADAPTIVE:-false}"
     CONFIG[adaptive_failures]="${BH_ADAPTIVE_FAILURES}"; CONFIG[adaptive_carriers]="${BH_ADAPTIVE_CARRIERS:+$(csv_to_toml_array "$BH_ADAPTIVE_CARRIERS")}"
+    # ENHANCEMENT — active pre-probe (client-side; empty BH_* => key omitted => reactive-only default)
+    CONFIG[adaptive_probe]="${BH_ADAPTIVE_PROBE}"; CONFIG[adaptive_probe_interval]="${BH_ADAPTIVE_PROBE_INTERVAL}"; CONFIG[adaptive_probe_fails]="${BH_ADAPTIVE_PROBE_FAILS}"
     CONFIG[kcp_mode]="${BH_KCP_MODE:-fast2}"; CONFIG[kcp_data_shards]="${BH_KCP_DATA:-10}"
     CONFIG[kcp_parity_shards]="${BH_KCP_PARITY:-3}"; CONFIG[kcp_mtu]="${BH_KCP_MTU:-1350}"
     CONFIG[tun_encapsulation]="${BH_TUN_ENCAP}"; CONFIG[tun_name]="${BH_TUN_NAME:-leech}"
