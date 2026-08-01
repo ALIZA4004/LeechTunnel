@@ -1226,38 +1226,80 @@ EOF
         colorize red "panel failed to start — check: journalctl -u leech-panel -n 30"
     fi
     echo
-    colorize yellow "Panel SSH public key (run 'connect to panel' on each node and paste this):"
+    colorize cyan "To add a node: in the panel open Nodes → Enroll, fill name + IP, and copy the"
+    colorize cyan "per-node token it shows. On the node run this script → 'Connect to panel', paste"
+    colorize cyan "the token with the panel URL + admin password — the node authorizes itself."
+    echo
+    colorize yellow "Manual fallback — the panel's SSH public key (only needed if you skip the token flow):"
     cat /etc/leech-panel/id_ed25519.pub
     press_key
 }
 
+authorize_panel_key() { # $1 = pubkey line
+    local key="$1"
+    [ -z "$key" ] && return 1
+    mkdir -p /root/.ssh; chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
+    grep -qF "$key" /root/.ssh/authorized_keys || echo "$key" >> /root/.ssh/authorized_keys
+}
+
 connect_to_panel() {
     clear; colorize cyan "Connect this server to a LEECH panel (enroll as a node)" bold; echo
-    colorize yellow "Paste the panel's SSH public key (from the panel-install output), then Enter:"
-    local pubkey; read -r pubkey
-    if [ -n "$pubkey" ]; then
-        mkdir -p /root/.ssh; chmod 700 /root/.ssh; touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
-        grep -qF "$pubkey" /root/.ssh/authorized_keys || echo "$pubkey" >> /root/.ssh/authorized_keys
-        colorize green "✔ Panel key authorized — the panel can now control this node over SSH."
-    fi
-    echo
-    local url pw role name myip tok
-    prompt_with_default "Auto-register: panel URL (http://IP:PORT, empty to skip)" "" url
-    if [ -n "$url" ]; then
-        read -rsp "Panel admin password: " pw; echo
-        prompt_with_default "This node's role (iran/kharej/both)" "kharej" role
-        name=$(hostname); myip=$(hostname -I | awk '{print $1}')
-        tok=$(curl -s --max-time 8 -X POST -H 'Content-Type: application/json' -d "{\"password\":\"$pw\"}" "$url/api/login" | grep -oP '"token":"\K[^"]+')
-        if [ -n "$tok" ]; then
-            if curl -s --max-time 8 -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
-                 -d "{\"name\":\"$name\",\"role\":\"$role\",\"host\":\"$myip\",\"ssh_user\":\"root\",\"ssh_port\":22}" "$url/api/nodes" | grep -q '"ok":true'; then
-                colorize green "✔ Registered with the panel as '$name' ($role @ $myip)"
-            else
-                colorize yellow "node may already exist, or registration failed — you can add it manually in the panel UI ($myip)"
-            fi
+    local pairfile="/etc/leech/panel.pair"
+    local url token pw role name myip tok resp pubkey stored_url stored_tok
+    prompt_with_default "Panel URL (http://IP:PORT)  [empty = paste SSH key manually]" "" url
+
+    # ---- manual fallback: no URL, just paste the panel's SSH public key directly ----
+    if [ -z "$url" ]; then
+        colorize yellow "Paste the panel's SSH public key, then Enter:"
+        local pubkey2; read -r pubkey2
+        if authorize_panel_key "$pubkey2"; then
+            colorize green "✔ Panel key authorized — the panel can now control this node over SSH."
         else
-            colorize red "could not log in to the panel (check URL / password)"
+            colorize red "no key given — nothing changed."
         fi
+        [ -f "$config_dir/leech" ] || colorize yellow "Reminder: this node needs the LEECH core at $config_dir/leech for tunnels to run."
+        press_key; return
+    fi
+
+    # ---- token flow: paste the per-node token shown on the panel's node card ----
+    read -r -p "Enrollment token (copy it from the node's card in the panel): " token
+    [ -z "$token" ] && { colorize red "token is required"; press_key; return; }
+
+    # pairing lock: once paired, refuse to enroll into a *different* panel/token so no
+    # second panel can hijack this node. Re-running with the same panel+token is fine.
+    if [ -f "$pairfile" ]; then
+        stored_url=$(awk 'NR==1{print $1}' "$pairfile"); stored_tok=$(awk 'NR==1{print $2}' "$pairfile")
+        if [ "$stored_tok" != "$token" ] || [ "$stored_url" != "$url" ]; then
+            colorize red "This node is already paired to a panel: $stored_url"
+            colorize yellow "To move it to a different panel, first run:  rm -f $pairfile"
+            colorize yellow "and remove the old panel key from /root/.ssh/authorized_keys."
+            press_key; return
+        fi
+    fi
+
+    read -rsp "Panel admin password: " pw; echo
+    prompt_with_default "This node's role (iran/kharej/both)" "kharej" role
+    name=$(hostname); myip=$(hostname -I | awk '{print $1}')
+
+    tok=$(curl -s --max-time 8 -X POST -H 'Content-Type: application/json' \
+          -d "{\"password\":\"$pw\"}" "$url/api/login" | grep -oP '"token":"\K[^"]+')
+    [ -z "$tok" ] && { colorize red "could not log in to the panel (check URL / password)"; press_key; return; }
+
+    resp=$(curl -s --max-time 8 -X POST -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' \
+           -d "{\"token\":\"$token\",\"host\":\"$myip\"}" "$url/api/enroll")
+    if ! echo "$resp" | grep -q '"ok":true'; then
+        colorize red "enrollment failed: $(echo "$resp" | grep -oP '"error":"\K[^"]+')"
+        colorize yellow "Create this node in the panel (Nodes → Enroll) and paste its exact token."
+        press_key; return
+    fi
+
+    pubkey=$(echo "$resp" | grep -oP '"pubkey":"\K[^"]+')
+    if authorize_panel_key "$pubkey"; then
+        mkdir -p /etc/leech; printf '%s %s\n' "$url" "$token" > "$pairfile"; chmod 600 "$pairfile"
+        colorize green "✔ Paired with the panel and authorized — it now controls this node as '$name' ($role @ $myip)."
+    else
+        colorize red "the panel did not return its SSH key — enrollment incomplete."
     fi
     [ -f "$config_dir/leech" ] || colorize yellow "Reminder: this node needs the LEECH core at $config_dir/leech for tunnels to run."
     press_key
