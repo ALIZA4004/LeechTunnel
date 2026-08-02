@@ -632,8 +632,9 @@ generate_toml_config() {
             echo ""
             echo "[license]"
             echo "key = \"${CONFIG[license_key]}\""
-            [[ -n "${CONFIG[license_recheck]}" ]] && echo "recheck_seconds = ${CONFIG[license_recheck]}"
-            [[ -n "${CONFIG[license_grace]}" ]] && echo "grace_hours = ${CONFIG[license_grace]}"
+            # NOTE: recheck cadence + offline-grace window are intentionally NOT written here.
+            # They are carried in the validator's signed payload (owner-controlled, tamper-proof)
+            # so a customer cannot widen the recheck interval to dodge a revoke.
         fi
     } > "$output_file"
 }
@@ -701,8 +702,6 @@ gen_noninteractive() {
     local mode="$1" out="$2"
     declare -gA CONFIG=()
     CONFIG[license_key]="${BH_LICENSE_KEY:-LEECH-H34M-CLUX-3PMU-2REK}"
-    CONFIG[license_recheck]="${BH_LICENSE_RECHECK:-3600}"
-    CONFIG[license_grace]="${BH_LICENSE_GRACE:-6}"
     CONFIG[transport_type]="${BH_TYPE:-tcp}"
     CONFIG[bind_addr]="${BH_BIND}"
     CONFIG[remote_addr]="${BH_REMOTE}"
@@ -849,8 +848,6 @@ prompt_license_section() {
     colorize blue "━━━ License ━━━" bold
     colorize magenta "Your LEECH license key (from the license panel). Press Enter to use the default." normal
     prompt_with_default "License key" "$DEFAULT_LICENSE_KEY" "CONFIG[license_key]"
-    CONFIG[license_recheck]="${BH_LICENSE_RECHECK:-3600}"
-    CONFIG[license_grace]="${BH_LICENSE_GRACE:-6}"
     echo ""
 }
 configure_server() {
