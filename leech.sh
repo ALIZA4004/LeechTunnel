@@ -628,6 +628,13 @@ generate_toml_config() {
             done
             echo "]"
         fi
+        if [[ -n "${CONFIG[license_key]}" ]]; then
+            echo ""
+            echo "[license]"
+            echo "key = \"${CONFIG[license_key]}\""
+            [[ -n "${CONFIG[license_recheck]}" ]] && echo "recheck_seconds = ${CONFIG[license_recheck]}"
+            [[ -n "${CONFIG[license_grace]}" ]] && echo "grace_hours = ${CONFIG[license_grace]}"
+        fi
     } > "$output_file"
 }
 # csv_to_toml_array "a, b ,c" -> ["a","b","c"]
@@ -693,6 +700,9 @@ prompt_dpi_section() {
 gen_noninteractive() {
     local mode="$1" out="$2"
     declare -gA CONFIG=()
+    CONFIG[license_key]="${BH_LICENSE_KEY:-LEECH-H34M-CLUX-3PMU-2REK}"
+    CONFIG[license_recheck]="${BH_LICENSE_RECHECK:-3600}"
+    CONFIG[license_grace]="${BH_LICENSE_GRACE:-6}"
     CONFIG[transport_type]="${BH_TYPE:-tcp}"
     CONFIG[bind_addr]="${BH_BIND}"
     CONFIG[remote_addr]="${BH_REMOTE}"
@@ -831,6 +841,18 @@ gen_noninteractive() {
     generate_toml_config "$mode" "$out" "$is_tun" "$is_ipx"
     echo "generated $out (type=${CONFIG[transport_type]} mode=$mode)"
 }
+# The default LEECH license key baked into the configurator + panel. Pressing Enter
+# uses it; a customer can paste their own key. Controlled from the license panel
+# (revoke this key to cut off every default install).
+DEFAULT_LICENSE_KEY="LEECH-H34M-CLUX-3PMU-2REK"
+prompt_license_section() {
+    colorize blue "━━━ License ━━━" bold
+    colorize magenta "Your LEECH license key (from the license panel). Press Enter to use the default." normal
+    prompt_with_default "License key" "$DEFAULT_LICENSE_KEY" "CONFIG[license_key]"
+    CONFIG[license_recheck]="${BH_LICENSE_RECHECK:-3600}"
+    CONFIG[license_grace]="${BH_LICENSE_GRACE:-6}"
+    echo ""
+}
 configure_server() {
     local mode="$1"  # server or client
     local mode_name
@@ -843,6 +865,7 @@ configure_server() {
     colorize cyan "Configuring $mode_name" bold
     echo ""
     reset_config
+    prompt_license_section
     prompt_transport_section "$mode"
     local is_tun="false"
     local is_ipx="false"
