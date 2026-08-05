@@ -68,6 +68,17 @@ Setup:
 
 Keep the panel current with **4 → Update panel** (verified hot‑swap, auto‑rollback). EN / فارسی.
 
+## Roadmap
+
+Planned for upcoming releases:
+
+- **Automatic SSL / TLS certificates** — issue and auto‑renew certificates for your
+  servers straight from the panel and the configurator, no manual setup.
+- **Panel over the tunnel** — the panel reaches its nodes through the LEECH tunnel
+  itself, dropping the **SSH** dependency (no open SSH port needed between servers).
+
+…more on the way.
+
 ---
 
 ## نصب (فارسی)
@@ -107,3 +118,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/i
    ترافیک/CPU/RAMِ هر تانل (تصویرِ بالا).
 
 بروزرسانیِ پنل: **۴ → Update panel** (هات‌سواپِ تأییدشده با بازگشتِ خودکار).
+
+---
+
+## فیچرهای آینده
+
+در نسخه‌های بعدی اضافه می‌شوند:
+
+- **گرفتنِ خودکارِ گواهیِ SSL/TLS** — دریافت و تمدیدِ خودکارِ گواهی برای سرورها مستقیم از
+  پنل و اسکریپت، بدونِ تنظیمِ دستی.
+- **ارتباطِ پنل از خودِ تانل** — پنل از طریقِ خودِ تانلِ LEECH به نودها وصل می‌شود و وابستگی
+  به **SSH** حذف می‌شود (نیازی به پورتِ SSHِ باز بینِ سرورها نیست).
+
+…و مواردِ بیشتر.
