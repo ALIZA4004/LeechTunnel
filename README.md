@@ -29,12 +29,12 @@ command, and opens the menu. Run it on **both** servers (inside and abroad).
 ```bash
 git clone https://github.com/ALIZA4004/LeechTunnel.git
 cd LeechTunnel
-bash leech.sh   # auto-downloads the obfuscated core (v1.0 release) into /root/leech
+bash leech.sh   # auto-downloads the obfuscated core (latest release) into /root/leech
 ```
 
-The obfuscated core binary ships as the **[v1.0 release](https://github.com/ALIZA4004/LeechTunnel/releases/tag/v1.0)**
+The obfuscated core binary ships as the **[latest release](https://github.com/ALIZA4004/LeechTunnel/releases/latest)**
 asset — not in the file tree — so `leech.sh` and `install.sh` fetch it from
-`https://github.com/ALIZA4004/LeechTunnel/releases/download/v1.0/leech` automatically.
+`https://github.com/ALIZA4004/LeechTunnel/releases/latest/download/leech` automatically.
 To place it by hand:
 
 ```bash

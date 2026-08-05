@@ -99,12 +99,23 @@ install_jq() {
         fi
     fi
 }
+# The quantum (forged-TCP) and ipx (raw-packet) engines link libpcap at runtime
+# (ldd: libpcap.so.0.8). Provision it so those transports don't fail to start.
+install_libpcap() {
+    if ! ldconfig -p 2>/dev/null | grep -q 'libpcap\.so\.0\.8'; then
+        if command -v apt-get &> /dev/null; then
+            colorize yellow "Installing libpcap0.8 (quantum/ipx raw engine dependency)..."
+            sudo apt-get update && sudo apt-get install -y libpcap0.8
+        fi
+    fi
+}
 download_and_extract_leech() {
     if [[ "$1" == "menu" ]]; then
         colorize cyan "Reinstalling / updating the LEECH core..." bold
         rm -f "${config_dir}/leech" >/dev/null 2>&1
     fi
     mkdir -p "$config_dir"
+    install_libpcap
     # 1) Already installed -> use it. We build LEECH ourselves; no download needed.
     if [[ -f "${config_dir}/leech" ]]; then
         chmod u+x "${config_dir}/leech" 2>/dev/null
@@ -218,7 +229,7 @@ prompt_transport_section() {
     local mode="$1"
     local is_ipx="false"
     colorize blue "━━━ Transport Configuration ━━━" bold
-    local valid_transports=(tcp tcpmux xtcpmux ws wss wsmux wssmux xwsmux anytls kcp tun)
+    local valid_transports=(tcp tcpmux xtcpmux ws wss wsmux wssmux xwsmux anytls kcp http https quantum tun)
     echo "Available transports:"
     printf '  • %s\n' "${valid_transports[@]}"
     while true; do
@@ -331,6 +342,8 @@ prompt_tun_section() {
         prompt_with_default "MTU" "1320" CONFIG[tun_mtu]
     else
         prompt_with_default "MTU" "1500" CONFIG[tun_mtu]
+        # Stage-4: tun/tcp outer-stream token handshake (tun/ipx has no outer stream). Set on BOTH ends.
+        prompt_boolean "Outer-stream token auth (outer_auth) [set on BOTH ends]" "false" CONFIG[tun_outer_auth]
     fi
     echo ""
 }
@@ -377,6 +390,7 @@ prompt_tuning_section() {
     if [[ "$is_ipx" == "true" ]]; then
         prompt_with_default "Batch Size" "2048" CONFIG[batch_size]
         prompt_with_default "SO_SNDBUF (0 = auto)" "0" CONFIG[so_sndbuf]
+        prompt_with_default "TPACKET profile (blank = default)" "" CONFIG[tpacket_profile]
     else
         prompt_with_default "TCP MSS (0 = auto)" "0" CONFIG[tcp_mss]
         prompt_with_default "SO_RCVBUF (0 = auto)" "0" CONFIG[so_rcvbuf]
@@ -467,6 +481,22 @@ prompt_ipx_section() {
         prompt_with_default "ICMP Type" "0" CONFIG[ipx_icmp_type]
         prompt_with_default "ICMP Code" "0" CONFIG[ipx_icmp_code]
     fi
+    # Stage-4: raw-engine controls (blank = profile/faithful default)
+    prompt_with_default "Raw IP protocol number override (blank = profile default)" "" CONFIG[ipx_protocol]
+    prompt_with_default "Spoof source IP (blank = none)" "" CONFIG[ipx_spoof_src]
+    prompt_with_default "Spoof destination IP (blank = none)" "" CONFIG[ipx_spoof_dst]
+    prompt_boolean "Custom packet mode" "false" CONFIG[ipx_custom_packet]
+    # proto58 (ENHANCEMENT): wrap the crafted IPv4 in an OUTER IPv6/next-header-58 shell
+    # and L2-inject it (needs global IPv6 that reaches both ends). Composes with the
+    # profile (use tcp); this is NOT the same as profile=bip (that only changes the inner proto).
+    prompt_boolean "proto58 outer IPv6 shell (wrap+L2-inject; needs IPv6 both ends) — not profile=bip" "false" CONFIG[ipx_proto58]
+    if [[ "${CONFIG[ipx_proto58]}" == "true" ]]; then
+        prompt_with_default "  proto58 source IPv6 (THIS box's GLOBAL v6)" "" CONFIG[ipx_proto58_src6]
+        prompt_with_default "  proto58 dest IPv6 (PEER box's GLOBAL v6)" "" CONFIG[ipx_proto58_dst6]
+        prompt_with_default "  proto58 gateway MAC override (blank = auto via IPv4 ARP)" "" CONFIG[ipx_proto58_gwmac]
+    fi
+    prompt_with_default "Allowed client IPs (comma-separated, blank = any)" "" CONFIG[ipx_allowed_raw]
+    [[ -n "${CONFIG[ipx_allowed_raw]}" ]] && CONFIG[ipx_allowed_client_ips]="$(csv_to_toml_array "${CONFIG[ipx_allowed_raw]}")"
     echo ""
 }
 generate_toml_config() {
@@ -534,6 +564,17 @@ generate_toml_config() {
         [[ -n "${CONFIG[adaptive_probe]}" ]]          && echo "adaptive_probe = ${CONFIG[adaptive_probe]}"
         [[ -n "${CONFIG[adaptive_probe_interval]}" ]] && echo "adaptive_probe_interval = ${CONFIG[adaptive_probe_interval]}"
         [[ -n "${CONFIG[adaptive_probe_fails]}" ]]    && echo "adaptive_probe_fails = ${CONFIG[adaptive_probe_fails]}"
+        # --- Dagger-fusion Stage-1 ENHANCEMENTS (opt-in; empty => key omitted, faithful default) ---
+        # tls_fragment: split the ClientHello across TCP segments (anti-SNI-reassembly; wss/wssmux/anytls).
+        # probe_decoy: unauth prober of a raw tcp/kcp port gets a fake nginx 200 instead of a tunnel tell.
+        # runtime_tune: runtime kcp/quantum band retuner + low-RAM governor (SPEED).
+        [[ -n "${CONFIG[tls_fragment]}" ]] && echo "tls_fragment = ${CONFIG[tls_fragment]}"
+        [[ -n "${CONFIG[probe_decoy]}" ]]  && echo "probe_decoy = ${CONFIG[probe_decoy]}"
+        [[ -n "${CONFIG[runtime_tune]}" ]] && echo "runtime_tune = ${CONFIG[runtime_tune]}"
+        # Stage-4: obfs_padding (noise record padding, tcp/tcpmux) + tls_fingerprint (anytls uTLS
+        # profile: empty=browser utls, "go"=stock crypto/tls). Both are [transport] fields.
+        [[ -n "${CONFIG[obfs_padding]}" ]]    && echo "obfs_padding = ${CONFIG[obfs_padding]}"
+        [[ -n "${CONFIG[tls_fingerprint]}" ]] && echo "tls_fingerprint = \"${CONFIG[tls_fingerprint]}\""
         echo ""
         if [[ "$is_tun" == "true" ]]; then
             echo "[tun]"
@@ -543,6 +584,9 @@ generate_toml_config() {
             echo "remote_addr = \"${CONFIG[tun_remote_addr]}\""
             echo "health_port = ${CONFIG[tun_health_port]}"
             echo "mtu = ${CONFIG[tun_mtu]}"
+            # Stage-4: outer_auth (tun/tcp ONLY — tun/ipx has no outer stream). Token handshake on
+            # the outer conn; must be set on BOTH ends. Default off omits the key (faithful raw relay).
+            [[ "${CONFIG[tun_encapsulation]}" != "ipx" && -n "${CONFIG[tun_outer_auth]}" ]] && echo "outer_auth = ${CONFIG[tun_outer_auth]}"
             echo ""
         fi
         if [[ "$is_ipx" == "true" ]]; then
@@ -554,6 +598,19 @@ generate_toml_config() {
             echo "interface = \"${CONFIG[ipx_interface]}\""
             [[ -n "${CONFIG[ipx_icmp_type]}" ]] && echo "icmp_type = ${CONFIG[ipx_icmp_type]}"
             [[ -n "${CONFIG[ipx_icmp_code]}" ]] && echo "icmp_code = ${CONFIG[ipx_icmp_code]}"
+            # Stage-4: raw-engine controls. protocol overrides the profile's outer IP proto;
+            # spoof_src/dst forge the outer addresses; custom_packet toggles the custom crafter;
+            # allowed_client_ips restricts accepted peers (already a TOML array from the gen reader).
+            [[ -n "${CONFIG[ipx_protocol]}" ]]           && echo "protocol = ${CONFIG[ipx_protocol]}"
+            [[ -n "${CONFIG[ipx_spoof_src]}" ]]          && echo "spoof_src_ip = \"${CONFIG[ipx_spoof_src]}\""
+            [[ -n "${CONFIG[ipx_spoof_dst]}" ]]          && echo "spoof_dst_ip = \"${CONFIG[ipx_spoof_dst]}\""
+            [[ -n "${CONFIG[ipx_custom_packet]}" ]]      && echo "custom_packet = ${CONFIG[ipx_custom_packet]}"
+            # proto58: outer IPv6/NH-58 shell (bool) + the two global v6 endpoints + optional gw-MAC override.
+            [[ -n "${CONFIG[ipx_proto58]}" ]]            && echo "proto58 = ${CONFIG[ipx_proto58]}"
+            [[ -n "${CONFIG[ipx_proto58_src6]}" ]]       && echo "proto58_src_ipv6 = \"${CONFIG[ipx_proto58_src6]}\""
+            [[ -n "${CONFIG[ipx_proto58_dst6]}" ]]       && echo "proto58_dst_ipv6 = \"${CONFIG[ipx_proto58_dst6]}\""
+            [[ -n "${CONFIG[ipx_proto58_gwmac]}" ]]      && echo "proto58_gw_mac = \"${CONFIG[ipx_proto58_gwmac]}\""
+            [[ -n "${CONFIG[ipx_allowed_client_ips]}" ]] && echo "allowed_client_ips = ${CONFIG[ipx_allowed_client_ips]}"
             echo ""
         fi
         if [[ "${CONFIG[transport_type]}" =~ mux$ ]]; then
@@ -575,6 +632,31 @@ generate_toml_config() {
             [[ -n "${CONFIG[kcp_rcv_wnd]}" ]] && echo "rcv_wnd = ${CONFIG[kcp_rcv_wnd]}"
             echo ""
         fi
+        if [[ "${CONFIG[transport_type]}" =~ ^(http|https)$ ]]; then
+            echo "[http_settings]"
+            [[ -n "${CONFIG[http_fake_domain]}" ]]    && echo "fake_domain = \"${CONFIG[http_fake_domain]}\""
+            [[ -n "${CONFIG[http_fake_ua]}" ]]        && echo "fake_ua = \"${CONFIG[http_fake_ua]}\""
+            [[ -n "${CONFIG[http_path]}" ]]           && echo "path = \"${CONFIG[http_path]}\""
+            [[ -n "${CONFIG[http_session_cookie]}" ]] && echo "session_cookie = \"${CONFIG[http_session_cookie]}\""
+            echo ""
+        fi
+        if [[ "${CONFIG[transport_type]}" == "quantum" ]]; then
+            echo "[quantum]"
+            echo "mtu = ${CONFIG[quantum_mtu]:-1350}"
+            echo "block = \"${CONFIG[quantum_block]:-aes}\""
+            echo "data_shards = ${CONFIG[quantum_data_shards]:-10}"
+            echo "parity_shards = ${CONFIG[quantum_parity_shards]:-1}"
+            [[ -n "${CONFIG[quantum_flags]}" ]]     && echo "flags = \"${CONFIG[quantum_flags]}\""
+            [[ -n "${CONFIG[quantum_interface]}" ]] && echo "interface = \"${CONFIG[quantum_interface]}\""
+            [[ -n "${CONFIG[quantum_local_ip]}" ]]  && echo "local_ip = \"${CONFIG[quantum_local_ip]}\""
+            [[ -n "${CONFIG[quantum_snd_wnd]}" ]]   && echo "snd_wnd = ${CONFIG[quantum_snd_wnd]}"
+            [[ -n "${CONFIG[quantum_rcv_wnd]}" ]]   && echo "rcv_wnd = ${CONFIG[quantum_rcv_wnd]}"
+            # Stage-4: ipv6 (fake-TCP IPv6 src), router (next-hop gateway MAC override), read_buffer (pcap ring).
+            [[ -n "${CONFIG[quantum_ipv6]}" ]]        && echo "ipv6 = \"${CONFIG[quantum_ipv6]}\""
+            [[ -n "${CONFIG[quantum_router]}" ]]      && echo "router = \"${CONFIG[quantum_router]}\""
+            [[ -n "${CONFIG[quantum_read_buffer]}" ]] && echo "read_buffer = ${CONFIG[quantum_read_buffer]}"
+            echo ""
+        fi
         echo "[security]"
         if [[ "$is_ipx" == "true" ]]; then
             echo "enable_encryption = ${CONFIG[enable_encryption]}"
@@ -585,7 +667,20 @@ generate_toml_config() {
             }
         else
             echo "token = \"${CONFIG[token]}\""
+            # ENHANCEMENT: optional payload AEAD on a stream carrier (default off = faithful). Needed
+            # for pad_frames, and usable as a double-encryption layer under TLS/Noise if wanted.
+            if [[ "${CONFIG[enable_encryption]}" == "true" ]]; then
+                echo "enable_encryption = true"
+                echo "algorithm = \"${CONFIG[algorithm]}\""
+                echo "psk = \"${CONFIG[psk]}\""
+                echo "kdf_iterations = ${CONFIG[kdf_iterations]}"
+            fi
         fi
+        # Stage-1 length-padding (Dagger fusion) — size-classed, 1 MiB-budget-capped random pad on the
+        # crypto.Conn AEAD frames; effective only when enable_encryption is on. Set on BOTH ends.
+        [[ -n "${CONFIG[pad_frames]}" ]] && echo "pad_frames = ${CONFIG[pad_frames]}"
+        [[ -n "${CONFIG[pad_min]}" ]]    && echo "pad_min = ${CONFIG[pad_min]}"
+        [[ -n "${CONFIG[pad_max]}" ]]    && echo "pad_max = ${CONFIG[pad_max]}"
         echo ""
         if [[ -n "${CONFIG[tls_sni]}" || -n "${CONFIG[tls_cert]}" || -n "${CONFIG[tls_sni_list]}" ]]; then
             echo "[tls]"
@@ -606,6 +701,10 @@ generate_toml_config() {
         [[ -n "${CONFIG[buffer_profile]}" ]]  && echo "buffer_profile = \"${CONFIG[buffer_profile]}\""
         [[ -n "${CONFIG[batch_size]}" ]]      && echo "batch_size = ${CONFIG[batch_size]}"
         [[ -n "${CONFIG[read_timeout]}" ]]    && echo "read_timeout = ${CONFIG[read_timeout]}"
+        # Stage-4: tpacket_profile (ipx afpacket ring geometry), max_connections, write_timeout (seconds).
+        [[ -n "${CONFIG[tpacket_profile]}" ]] && echo "tpacket_profile = \"${CONFIG[tpacket_profile]}\""
+        [[ -n "${CONFIG[max_connections]}" ]] && echo "max_connections = ${CONFIG[max_connections]}"
+        [[ -n "${CONFIG[write_timeout_sec]}" ]] && echo "write_timeout = ${CONFIG[write_timeout_sec]}"
         echo ""
         if [[ "${CONFIG[accept_udp]}" == "true" ]]; then
             echo "[accept_udp]"
@@ -655,6 +754,30 @@ prompt_kcp_section() {
     prompt_with_default "FEC data shards" "10" CONFIG[kcp_data_shards]
     prompt_with_default "FEC parity shards (0 = FEC off)" "3" CONFIG[kcp_parity_shards]
     prompt_with_default "MTU" "1350" CONFIG[kcp_mtu]
+    # Stage-4: KCP flow windows in packets (blank = 1024 each).
+    prompt_with_default "KCP send window (packets, blank = 1024)" "" CONFIG[kcp_snd_wnd]
+    prompt_with_default "KCP recv window (packets, blank = 1024)" "" CONFIG[kcp_rcv_wnd]
+    echo ""
+}
+prompt_http_section() {
+    [[ ! "$1" =~ ^(http|https)$ ]] && return
+    colorize blue "━━━ HTTP Mimicry Configuration ━━━" bold
+    colorize magenta "The tunnel looks like ordinary web browsing (realistic GET + nginx 200; https adds a real TLS session)." normal
+    prompt_with_default "Fake domain (Host header / TLS SNI)" "www.google.com" CONFIG[http_fake_domain]
+    prompt_with_default "GET path" "/search" CONFIG[http_path]
+    prompt_with_default "Fake User-Agent (empty = default Chrome)" "" CONFIG[http_fake_ua]
+    prompt_with_default "Session cookie name (empty = none)" "" CONFIG[http_session_cookie]
+    echo ""
+}
+prompt_quantum_section() {
+    [[ "$1" != "quantum" ]] && return
+    colorize blue "━━━ Quantum (forged-TCP) Configuration ━━━" bold
+    colorize magenta "KCP inside FORGED TCP segments — zero UDP on the wire; survives UDP blocking + stateful-TCP fingerprinting. Linux + root only." normal
+    prompt_with_default "MTU" "1350" CONFIG[quantum_mtu]
+    prompt_with_default "KCP mask cipher [aes/salsa20/none]" "aes" CONFIG[quantum_block]
+    prompt_with_default "FEC data shards" "10" CONFIG[quantum_data_shards]
+    prompt_with_default "FEC parity shards (0 = off)" "1" CONFIG[quantum_parity_shards]
+    prompt_with_default "Forged TCP flags [PA/SA/FA/...]" "PA" CONFIG[quantum_flags]
     echo ""
 }
 prompt_dpi_section() {
@@ -664,6 +787,7 @@ prompt_dpi_section() {
         prompt_boolean "Secret WS path (hide /channel,/tunnel via HMAC(token)) [set on BOTH ends]" "true" CONFIG[ws_path_secret]
         prompt_with_default "  ↳ Fronting Host header (empty = use SNI under acceleration)" "" CONFIG[ws_host]
         [[ "$mode" == "server" ]] && prompt_with_default "  ↳ Fake-site reverse-proxy upstream (empty = built-in decoy page)" "" CONFIG[fake_site_upstream]
+        [[ "$mode" == "server" ]] && prompt_with_default "  ↳ Fake-site local HTML file (empty = upstream / built-in decoy)" "" CONFIG[fake_site_file]
     fi
     if [[ "$transport" == "xtcpmux" ]]; then
         prompt_boolean "Rotate xtcpmux obfs magic per-deployment (from token) [BOTH ends]" "true" CONFIG[obfs_rotate_magic]
@@ -673,6 +797,10 @@ prompt_dpi_section() {
         if [[ -n "${CONFIG[obfs_junk_count]}" && "${CONFIG[obfs_junk_count]}" != "0" ]]; then
             CONFIG[obfs_junk_min]="40"; CONFIG[obfs_junk_max]="1000"
         fi
+    fi
+    # Stage-4: Noise record padding max (tcp/tcpmux; needs obfuscation=noise). Blank = carrier default 256.
+    if [[ "$transport" =~ ^(tcp|tcpmux)$ ]]; then
+        prompt_with_default "Noise record padding max bytes (blank = 256; needs obfuscation=noise)" "" CONFIG[obfs_padding]
     fi
     if [[ "$transport" =~ ^(wss|wssmux|anytls)$ ]]; then
         prompt_with_default "SNI rotation list (comma-separated; empty = single SNI)" "" CONFIG[dpi_sni_list_raw]
@@ -692,6 +820,20 @@ prompt_dpi_section() {
                 prompt_with_default "    ↳ Consecutive probe failures before switching early" "2" CONFIG[adaptive_probe_fails]
             fi
         fi
+    fi
+    # --- Dagger-fusion Stage-1 toggles (opt-in; set on BOTH ends where noted) ---
+    if [[ "$transport" =~ ^(wss|wssmux|anytls)$ ]]; then
+        prompt_boolean "Split ClientHello across TCP segments (anti-SNI-reassembly)" "true" CONFIG[tls_fragment]
+    fi
+    # Stage-4: anytls uTLS fingerprint (blank = randomized browser uTLS; "go" = stock crypto/tls).
+    if [[ "$transport" == "anytls" ]]; then
+        prompt_with_default "uTLS fingerprint [blank = browser utls / go = stock]" "" CONFIG[tls_fingerprint]
+    fi
+    if [[ "$mode" == "server" && "$transport" =~ ^(tcp|tcpmux|kcp)$ ]]; then
+        prompt_boolean "Active-probe decoy (an unauth prober sees a fake nginx 200)" "true" CONFIG[probe_decoy]
+    fi
+    if [[ "$transport" == "kcp" ]]; then
+        prompt_boolean "Runtime adaptive tuner (kcp band retune + low-RAM governor)" "true" CONFIG[runtime_tune]
     fi
     echo ""
 }
@@ -735,7 +877,7 @@ gen_noninteractive() {
     # A server with no cert on disk falls back to an in-memory self-signed one that
     # is regenerated on every restart, i.e. a fingerprint that changes each bounce.
     # Mint the same stable pair the interactive path does instead.
-    if [[ "$mode" == "server" && "${BH_TYPE}" =~ ^(wss|wssmux|anytls)$ ]]; then
+    if [[ "$mode" == "server" && "${BH_TYPE}" =~ ^(wss|wssmux|anytls|https)$ ]]; then
         if [[ ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
             mkdir -p "$(dirname "$CERT_FILE")"
             openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 \
@@ -763,11 +905,18 @@ gen_noninteractive() {
     CONFIG[adaptive_failures]="${BH_ADAPTIVE_FAILURES}"; CONFIG[adaptive_carriers]="${BH_ADAPTIVE_CARRIERS:+$(csv_to_toml_array "$BH_ADAPTIVE_CARRIERS")}"
     # ENHANCEMENT — active pre-probe (client-side; empty BH_* => key omitted => reactive-only default)
     CONFIG[adaptive_probe]="${BH_ADAPTIVE_PROBE}"; CONFIG[adaptive_probe_interval]="${BH_ADAPTIVE_PROBE_INTERVAL}"; CONFIG[adaptive_probe_fails]="${BH_ADAPTIVE_PROBE_FAILS}"
+    # Dagger-fusion Stage-1 toggles (empty => key omitted => faithful default off)
+    CONFIG[tls_fragment]="${BH_TLS_FRAGMENT}"; CONFIG[probe_decoy]="${BH_PROBE_DECOY}"; CONFIG[runtime_tune]="${BH_RUNTIME_TUNE}"
+    # Stage-4: obfs_padding (tcp/tcpmux noise padding) + tls_fingerprint (anytls uTLS) — both [transport].
+    CONFIG[obfs_padding]="${BH_OBFS_PADDING}"; CONFIG[tls_fingerprint]="${BH_TLS_FINGERPRINT}"
+    CONFIG[pad_frames]="${BH_PAD_FRAMES}"; CONFIG[pad_min]="${BH_PAD_MIN}"; CONFIG[pad_max]="${BH_PAD_MAX}"
     CONFIG[kcp_mode]="${BH_KCP_MODE:-fast2}"; CONFIG[kcp_data_shards]="${BH_KCP_DATA:-10}"
     CONFIG[kcp_parity_shards]="${BH_KCP_PARITY:-3}"; CONFIG[kcp_mtu]="${BH_KCP_MTU:-1350}"
     CONFIG[tun_encapsulation]="${BH_TUN_ENCAP}"; CONFIG[tun_name]="${BH_TUN_NAME:-leech}"
     CONFIG[tun_local_addr]="${BH_TUN_LOCAL:-10.10.10.1/24}"; CONFIG[tun_remote_addr]="${BH_TUN_REMOTE:-10.10.10.2/24}"
     CONFIG[tun_health_port]="${BH_TUN_HEALTH:-1234}"
+    # Stage-4: tun/tcp outer-stream token auth (the writer emits it only when encap != ipx).
+    CONFIG[tun_outer_auth]="${BH_TUN_AUTH}"
     # the raw engine adds outer headers, so it needs the smaller MTU the
     # interactive path offers (1320 vs 1500) — the panel has one field for both
     local _def_mtu=1500; [[ "${BH_TUN_ENCAP}" == "ipx" ]] && _def_mtu=1320
@@ -776,13 +925,27 @@ gen_noninteractive() {
     CONFIG[ipx_listen_ip]="${BH_IPX_LISTEN}"; CONFIG[ipx_dst_ip]="${BH_IPX_DST}"
     # the NIC name is per-box, so it must be resolved here and not by the panel
     CONFIG[ipx_interface]="${BH_IPX_IFACE:-$(ip route show default 2>/dev/null | awk '{print $5; exit}')}"
+    # Stage-4: raw-engine ipx controls (empty => key omitted => profile/faithful default).
+    CONFIG[ipx_protocol]="${BH_IPX_PROTOCOL}"
+    CONFIG[ipx_spoof_src]="${BH_IPX_SPOOF_SRC}"; CONFIG[ipx_spoof_dst]="${BH_IPX_SPOOF_DST}"
+    CONFIG[ipx_custom_packet]="${BH_IPX_CUSTOM}"
+    CONFIG[ipx_proto58]="${BH_IPX_PROTO58}"
+    CONFIG[ipx_proto58_src6]="${BH_IPX_PROTO58_SRC6}"; CONFIG[ipx_proto58_dst6]="${BH_IPX_PROTO58_DST6}"
+    CONFIG[ipx_proto58_gwmac]="${BH_IPX_PROTO58_GWMAC}"
+    CONFIG[ipx_allowed_client_ips]="${BH_IPX_ALLOWED:+$(csv_to_toml_array "$BH_IPX_ALLOWED")}"
     CONFIG[auto_tuning]="${BH_AUTO_TUNING:-true}"; CONFIG[tuning_profile]="${BH_TUNING_PROFILE:-balanced}"
     CONFIG[workers]="${BH_WORKERS:-0}"
     # a layer-3 device sees far more packets per second than a stream carrier, so
     # the interactive path gives tun a much deeper channel
     local _def_chan=4096; [[ "${BH_TYPE}" == "tun" ]] && _def_chan=10000
     CONFIG[channel_size]="${BH_CHANNEL:-$_def_chan}"
-    CONFIG[batch_size]="${BH_BATCH}"; CONFIG[read_timeout]="${BH_READ_TIMEOUT}"
+    # batch_size default 2048 to MATCH the interactive path (prompt_with_default "Batch Size" "2048").
+    # The ipx engine's validatePerformanceSection REQUIRES batch_size>0, so a panel/--gen tunnel that
+    # omitted it (empty BH_BATCH) FATAL'd "batch_size must be > 0" — every ipx tunnel from the panel
+    # failed to start. Defaulting it here fixes ipx; harmless for the stream transports (unused).
+    CONFIG[batch_size]="${BH_BATCH:-2048}"; CONFIG[read_timeout]="${BH_READ_TIMEOUT}"
+    # Stage-4: [tuning] extras — tpacket_profile (ipx ring geometry), max_connections, write_timeout (sec).
+    CONFIG[tpacket_profile]="${BH_TPACKET_PROFILE}"; CONFIG[max_connections]="${BH_MAX_CONN}"; CONFIG[write_timeout_sec]="${BH_WRITE_TIMEOUT_SEC}"
     CONFIG[log_level]="${BH_LOG:-info}"
     # the forwarder choice is a tun-only helper (the interactive path only asks for
     # it there); on a stream transport the core's own default applies
@@ -807,6 +970,16 @@ gen_noninteractive() {
         else CONFIG[buffer_profile]="${BH_BUFFER_PROFILE:-balanced}"; fi
     fi
     CONFIG[kcp_snd_wnd]="${BH_KCP_SND_WND}"; CONFIG[kcp_rcv_wnd]="${BH_KCP_RCV_WND}"
+    # http/https mimicry ([http_settings]) — all optional (carrier applies browser-realistic defaults)
+    CONFIG[http_fake_domain]="${BH_HTTP_FAKE_DOMAIN}"; CONFIG[http_fake_ua]="${BH_HTTP_FAKE_UA}"
+    CONFIG[http_path]="${BH_HTTP_PATH}"; CONFIG[http_session_cookie]="${BH_HTTP_COOKIE}"
+    # quantum forged-TCP ([quantum]) — mtu/block/shards default in the writer; iface/local_ip auto if empty
+    CONFIG[quantum_mtu]="${BH_QUANTUM_MTU:-1350}"; CONFIG[quantum_block]="${BH_QUANTUM_BLOCK:-aes}"
+    CONFIG[quantum_data_shards]="${BH_QUANTUM_DATA:-10}"; CONFIG[quantum_parity_shards]="${BH_QUANTUM_PARITY:-1}"
+    CONFIG[quantum_flags]="${BH_QUANTUM_FLAGS}"; CONFIG[quantum_interface]="${BH_QUANTUM_IFACE}"; CONFIG[quantum_local_ip]="${BH_QUANTUM_LOCAL_IP}"
+    CONFIG[quantum_snd_wnd]="${BH_QUANTUM_SND_WND}"; CONFIG[quantum_rcv_wnd]="${BH_QUANTUM_RCV_WND}"
+    # Stage-4: quantum ipv6 (fake-TCP IPv6 src), router (gateway MAC override), read_buffer (pcap ring).
+    CONFIG[quantum_ipv6]="${BH_QUANTUM_IPV6}"; CONFIG[quantum_router]="${BH_QUANTUM_ROUTER}"; CONFIG[quantum_read_buffer]="${BH_QUANTUM_READ_BUFFER}"
     # icmp type/code are prompted (default 0) ONLY for the icmp profile — mirror that gate
     # so the generated TOML matches the interactive path (icmp_type=0/icmp_code=0), and
     # they are never written for other profiles.
@@ -878,6 +1051,8 @@ configure_server() {
     prompt_mux_section "${CONFIG[transport_type]}"
     prompt_tls_section "$mode" "${CONFIG[transport_type]}"
     prompt_kcp_section "${CONFIG[transport_type]}"
+    prompt_http_section "${CONFIG[transport_type]}"
+    prompt_quantum_section "${CONFIG[transport_type]}"
     prompt_dpi_section "$mode" "${CONFIG[transport_type]}"
     prompt_tuning_section "$is_ipx" "$is_tun"
     prompt_logging_section

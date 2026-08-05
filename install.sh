@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LeechTunnel installer — downloads the obfuscated LEECH core + the configurator
+# LeechTunnel installer — downloads the obfuscated LEECH core (latest release) + the configurator
 # into /root/leech and launches the interactive menu.
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/install.sh)
