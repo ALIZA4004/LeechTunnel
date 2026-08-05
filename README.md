@@ -12,8 +12,7 @@ interactive configurator + a web control panel. No dependencies, no build step.
 Run on **every** server (inside + abroad), as **root**:
 
 ```bash
-sudo -i
-bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/install.sh)
+sudo -i && bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/install.sh)
 ```
 
 Downloads the core + configurator into `/root/leech`, registers a `leech` command,
@@ -86,8 +85,7 @@ Planned for upcoming releases:
 روی **هر سرور** (داخل و خارج)، به‌عنوان **root**:
 
 ```bash
-sudo -i
-bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/install.sh)
+sudo -i && bash <(curl -fsSL https://raw.githubusercontent.com/ALIZA4004/LeechTunnel/main/install.sh)
 ```
 
 > 💡 **پیشنهادِ ما: از پنلِ وب استفاده کن.** بعد از نصب روی سرورها، به‌جای منوی خط‌فرمانِ
