@@ -1,3 +1,7 @@
+#!/usr/bin/env bash
+# NOTE: the shebang is REQUIRED — acme.sh registers this file as a renewal reloadcmd and execs
+# it directly; without a shebang the kernel ENOEXECs and /bin/sh (dash) would choke on the
+# bash-only syntax (herestrings, process substitution) before reaching the --ssl-reload dispatch.
 SCRIPT_VERSION="v1.0.0"
 service_dir="/etc/systemd/system"
 config_dir="/root/leech"
@@ -105,7 +109,8 @@ install_libpcap() {
     if ! ldconfig -p 2>/dev/null | grep -q 'libpcap\.so\.0\.8'; then
         if command -v apt-get &> /dev/null; then
             colorize yellow "Installing libpcap0.8 (quantum/ipx raw engine dependency)..."
-            sudo apt-get update && sudo apt-get install -y libpcap0.8
+            # bounded so a held dpkg lock can't hang a non-interactive panel --create
+            timeout 300 sudo apt-get update && timeout 180 sudo apt-get install -y libpcap0.8
         fi
     fi
 }
@@ -912,7 +917,18 @@ gen_noninteractive() {
     CONFIG[pad_frames]="${BH_PAD_FRAMES}"; CONFIG[pad_min]="${BH_PAD_MIN}"; CONFIG[pad_max]="${BH_PAD_MAX}"
     CONFIG[kcp_mode]="${BH_KCP_MODE:-fast2}"; CONFIG[kcp_data_shards]="${BH_KCP_DATA:-10}"
     CONFIG[kcp_parity_shards]="${BH_KCP_PARITY:-3}"; CONFIG[kcp_mtu]="${BH_KCP_MTU:-1350}"
-    CONFIG[tun_encapsulation]="${BH_TUN_ENCAP}"; CONFIG[tun_name]="${BH_TUN_NAME:-leech}"
+    CONFIG[tun_encapsulation]="${BH_TUN_ENCAP}"
+    # tun device name: default to a UNIQUE per-port name (leech<port>) so two tun endpoints
+    # co-hosted on one node never share the "leech" device — otherwise Fix 3's delete-by-name
+    # cleanup (ExecStartPre / panel_rm) on one tunnel could tear down another's live device.
+    # Panel/non-interactive path only; the interactive prompt keeps the plain "leech" default.
+    local _tun_port="${BH_BIND##*:}${BH_REMOTE##*:}"; _tun_port="${_tun_port//[^0-9]/}"
+    local _tun_nm="${BH_TUN_NAME:-leech${_tun_port:-0}}"
+    # the legacy default "leech" is SHARED by every tun tunnel → two tun tunnels (or an edit of
+    # one while it still holds the device) collide on it and the create fails. Force it unique
+    # per port even when the panel/env passes a bare "leech".
+    [[ "$_tun_nm" == "leech" ]] && _tun_nm="leech${_tun_port:-0}"
+    CONFIG[tun_name]="$_tun_nm"
     CONFIG[tun_local_addr]="${BH_TUN_LOCAL:-10.10.10.1/24}"; CONFIG[tun_remote_addr]="${BH_TUN_REMOTE:-10.10.10.2/24}"
     CONFIG[tun_health_port]="${BH_TUN_HEALTH:-1234}"
     # Stage-4: tun/tcp outer-stream token auth (the writer emits it only when encap != ipx).
@@ -991,9 +1007,14 @@ gen_noninteractive() {
     # these are written UNCONDITIONALLY inside their blocks when enabled, so default
     # them (empty would emit invalid TOML like 'kdf_iterations = ')
     CONFIG[algorithm]="${BH_ALGORITHM:-aes-256-gcm}"; CONFIG[kdf_iterations]="${BH_KDF_ITER:-100000}"
-    # an empty PSK with encryption on is a config that looks encrypted and is not
+    # an empty PSK with encryption on is a config that looks encrypted and is not. Guard it
+    # with a real error message on STDERR (the old ${BH_PSK:?...} aborted the whole shell
+    # BEFORE any echo, and panel_create suppressed stderr → the panel saw an empty exit 1).
     if [[ "${CONFIG[enable_encryption]}" == "true" ]]; then
-        CONFIG[psk]="${BH_PSK:?BH_PSK is required when encryption is enabled}"
+        if [[ -z "${BH_PSK:-}" ]]; then
+            echo "PSK is required when encryption is enabled" >&2; return 1
+        fi
+        CONFIG[psk]="${BH_PSK}"
     else
         CONFIG[psk]="${BH_PSK}"
     fi
@@ -1087,6 +1108,22 @@ create_systemd_service() {
     local config_file="$3"
     local service_file="${service_dir}/leech-${type}${port}.service"
     local desc_type="$(tr '[:lower:]' '[:upper:]' <<< "${type:0:1}")${type:1}"
+    # Fix 3: tun/ipx endpoints name a tun device in their [tun] section. A crashed or
+    # killed core can leave that device behind, and the next start then fails with
+    # "exit status 1". Bake a best-effort delete (leading '-' → ignore failure) so a
+    # leftover device never blocks a restart/recreate.
+    # Guarded via --tun-cleanup so the device is deleted ONLY when no OTHER config still
+    # claims the same name — a co-hosted tun tunnel that shares the name (legacy "leech"
+    # default) is never torn out from under. New tunnels get a unique leech<port> name, so
+    # this is belt-and-braces. Leading '-' → systemd ignores any failure.
+    local pre_cleanup="" svc_tun_dev
+    svc_tun_dev=$(awk -F'"' '/^name = /{print $2; exit}' "$config_file" 2>/dev/null)
+    [[ -n "$svc_tun_dev" ]] && pre_cleanup="ExecStartPre=-${config_dir}/leech.sh --tun-cleanup ${svc_tun_dev}"
+    # Health-status toggle: when the panel/operator turned "precise health monitoring" off,
+    # bake it into the unit env so the core skips writing /run/leech-<name>.status → --stats
+    # falls back to its socket/active heuristic. Default (unset/true) leaves it ON.
+    local health_env=""
+    [[ "${BH_HEALTH_STATUS:-}" =~ ^(0|false|no|off)$ ]] && health_env="Environment=BH_HEALTH_STATUS=0"
     cat > "$service_file" <<EOF
 [Unit]
 Description=LEECH $desc_type Port $port
@@ -1094,6 +1131,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
+${pre_cleanup}
+${health_env}
 ExecStart=${config_dir}/leech -c $config_file
 Restart=always
 RestartSec=3
@@ -1640,18 +1679,40 @@ fi
 # or a strict <type><port> id; nothing is interpolated from free-form user text.
 
 # --create <server|client> : BH_* env -> TOML -> systemd unit -> start.  emits JSON
+# --tun-cleanup <dev> : delete a leftover tun device, but ONLY if no OTHER endpoint config
+# still claims that device name. Baked as an ExecStartPre so a leftover device never blocks a
+# start, without ever tearing down a co-hosted tunnel that legitimately shares the name.
+tun_cleanup() {
+    local dev="$1" used=0 f
+    [[ -n "$dev" ]] || return 0
+    for f in "${config_dir}"/{iran,kharej}*.toml; do
+        [[ -f "$f" ]] || continue
+        [[ "$(awk -F'"' '/^name = /{print $2; exit}' "$f" 2>/dev/null)" == "$dev" ]] && used=$((used+1))
+    done
+    [[ "$used" -le 1 ]] && ip link del "$dev" >/dev/null 2>&1
+    return 0
+}
+
 panel_create() {
     # NOTE: gen_noninteractive/generate_toml_config assign to a non-local `port`,
     # which would clobber a `local port` here via bash dynamic scoping — so use
     # uniquely-named locals captured BEFORE calling gen.
     local mode="$1" pc_typ pc_port pc_out pc_svc pc_act
+    # Fix 3: raw-packet transports (quantum, tun/ipx) link libpcap at runtime; a freshly
+    # panel-provisioned node may lack it because the non-interactive path skips the normal
+    # install. Ensure it now — a cheap ldconfig no-op when already present.
+    case "${BH_TYPE:-}" in quantum|tun) install_libpcap >/dev/null 2>&1 ;; esac
     if [[ "$mode" == "server" ]]; then pc_typ=iran;   pc_port="${BH_BIND##*:}"
     else                               pc_typ=kharej; pc_port="${BH_REMOTE##*:}"; fi
     [[ "$pc_port" =~ ^[0-9]+$ ]] || { echo '{"ok":false,"error":"could not derive port from BH_BIND/BH_REMOTE"}'; return 1; }
     pc_out="${config_dir}/${pc_typ}${pc_port}.toml"
     pc_svc="leech-${pc_typ}${pc_port}"
-    if ! gen_noninteractive "$mode" "$pc_out" >/dev/null 2>&1; then
-        echo '{"ok":false,"error":"config generation failed"}'; return 1
+    local gen_out
+    if ! gen_out=$(gen_noninteractive "$mode" "$pc_out" 2>&1); then
+        # surface gen's own last line (its real reason) instead of a bare generic — otherwise
+        # a gen abort is an invisible empty exit-1 to the panel.
+        local msg; msg=$(printf '%s' "$gen_out" | tail -1 | tr -cd '[:alnum:] .:/_-')
+        echo "{\"ok\":false,\"error\":\"config generation failed: ${msg}\"}"; return 1
     fi
     create_systemd_service "$pc_typ" "$pc_port" "$pc_out" >/dev/null 2>&1
     systemctl is-active --quiet "$pc_svc" && pc_act=true || pc_act=false
@@ -1662,8 +1723,27 @@ panel_create() {
 panel_rm() {
     local id="$1"
     [[ "$id" =~ ^(iran|kharej)[0-9]+$ ]] || { echo '{"ok":false,"error":"bad id"}'; return 1; }
+    # Fix 3: capture the tun device name (if any) from the [tun] section BEFORE we delete
+    # the config, so we can drop a leftover device and never orphan it.
+    local rm_cfg="${config_dir}/${id}.toml" rm_dev=""
+    [[ -f "$rm_cfg" ]] && rm_dev=$(awk -F'"' '/^name = /{print $2; exit}' "$rm_cfg" 2>/dev/null)
     systemctl disable --now "leech-${id}.service" >/dev/null 2>&1
-    rm -f "${service_dir}/leech-${id}.service" "${config_dir}/${id}.toml"
+    # defensively reap a core still bound to this exact config (orphan case: unit file
+    # already gone but the process lingers). The space after "leech" guarantees this
+    # never matches the "leech.sh" that invoked us.
+    pkill -f "leech -c ${rm_cfg}" >/dev/null 2>&1
+    # remove the leftover tun device a killed/crashed core may have left behind — but ONLY if
+    # no OTHER endpoint's config still claims this device name, so a co-hosted tun tunnel that
+    # happens to share the name (legacy "leech" default) is never torn out from under.
+    if [[ -n "$rm_dev" ]]; then
+        local rm_used=0 rm_f
+        for rm_f in "${config_dir}"/{iran,kharej}*.toml; do
+            [[ -f "$rm_f" && "$rm_f" != "$rm_cfg" ]] || continue
+            [[ "$(awk -F'"' '/^name = /{print $2; exit}' "$rm_f" 2>/dev/null)" == "$rm_dev" ]] && { rm_used=1; break; }
+        done
+        [[ "$rm_used" -eq 0 ]] && ip link del "$rm_dev" >/dev/null 2>&1
+    fi
+    rm -f "${service_dir}/leech-${id}.service" "$rm_cfg"
     systemctl daemon-reload 2>/dev/null
     echo "{\"ok\":true,\"removed\":\"${id}\"}"
 }
@@ -1742,15 +1822,269 @@ panel_stats() {
                 match($0,/bytes_sent:[0-9]+/){s+=substr($0,RSTART+11,RLENGTH-11)}
                 END{print r+0,s+0}')
         fi
-        # connections: TCP established on the tunnel port, plus the raw UDP socket for
-        # connectionless carriers (kcp) so an active UDP tunnel shows at least its session.
-        conns=$(ss -Htn "$dir = :$port" 2>/dev/null | grep -c ESTAB)
-        [[ "${conns:-0}" -eq 0 ]] && [[ -n "$(ss -Huan "$dir = :$port" 2>/dev/null)" ]] && conns=1
+        # connections / connected-state.
+        # PREFERRED (new core, health-checker): the core writes its REAL per-tunnel
+        # connected state to /run/leech-<name>.status and refreshes it every heartbeat.
+        # Trust that value when fresh (mtime within HEALTH_STALE) — it is accurate for
+        # EVERY transport including the socketless raw/forged ones, and it reflects an
+        # actual PEER drop (not just "service active"). A crashed core leaves a stale
+        # file, which the freshness check rejects → we fall back below. Absent file
+        # (older core, or the health toggle is off) also falls back → no regression.
+        # The file is exactly three bare integers: "<conns> <flaps> <since>". flaps is a
+        # monotonic drop counter (catches a sub-poll self-healing drop even after conns
+        # recovers); since is the connected-since unix time (exact uptime, no poll quantize).
+        local sf="/run/leech-${name}.status" s_conns s_flaps s_since sage now_s
+        conns=""; hflaps=0; hage=0
+        if [[ -r "$sf" ]]; then
+            read -r s_conns s_flaps s_since _ < "$sf" 2>/dev/null
+            now_s=$(date +%s)
+            sage=$(( now_s - $(stat -c %Y "$sf" 2>/dev/null || echo 0) ))
+            if [[ "$s_conns" =~ ^[0-9]+$ && "$sage" -ge 0 && "$sage" -lt "${HEALTH_STALE:-15}" ]]; then
+                conns="$s_conns"
+                [[ "$s_flaps" =~ ^[0-9]+$ ]] && hflaps="$s_flaps"
+                # emit the AGE (seconds since the peer connected), computed on THIS node — a
+                # duration, so the panel anchors to its own poll clock and is immune to any
+                # node↔panel wall-clock skew (an absolute timestamp would make the timer wrong).
+                if [[ "$s_since" =~ ^[0-9]+$ && "$s_since" -gt 0 ]]; then
+                    hage=$(( now_s - s_since )); (( hage < 0 )) && hage=0
+                fi
+            fi
+        fi
+        if [[ -z "$conns" ]]; then
+            # FALLBACK: TCP established on the tunnel port, plus the raw UDP socket for
+            # connectionless carriers (kcp) so an active UDP tunnel shows its session.
+            conns=$(ss -Htn "$dir = :$port" 2>/dev/null | grep -c ESTAB)
+            [[ "${conns:-0}" -eq 0 ]] && [[ -n "$(ss -Huan "$dir = :$port" 2>/dev/null)" ]] && conns=1
+            # raw / forged-TCP transports (quantum, and tun/ipx which report type=tun) hold
+            # NO kernel socket on the tunnel port, so the ss checks read 0 even when the link
+            # is up and passing traffic. Treat an ACTIVE service as one live connection so the
+            # panel shows "connected" (matching the green dot) instead of a false "قطع".
+            [[ "${conns:-0}" -eq 0 && "$active" == true ]] && case "$transport" in quantum|tun) conns=1 ;; esac
+        fi
+        # precise uptime + disconnect tracking straight from systemd — poll-independent, so
+        # even a sub-poll restart (a 1-second blip) is caught: NRestarts counts every
+        # (re)start; ActiveEnterTimestampMonotonic gives the EXACT current up-duration.
+        nrestarts=$(systemctl show "leech-${name}" -p NRestarts --value 2>/dev/null); [[ "$nrestarts" =~ ^[0-9]+$ ]] || nrestarts=0
+        up_secs=0
+        if [[ "$active" == true ]]; then
+            aetm=$(systemctl show "leech-${name}" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
+            if [[ "$aetm" =~ ^[0-9]+$ && "$aetm" -gt 0 ]]; then
+                now_us=$(awk '{printf "%d", $1*1000000}' /proc/uptime 2>/dev/null)
+                [[ "$now_us" =~ ^[0-9]+$ ]] && up_secs=$(( (now_us - aetm) / 1000000 ))
+                (( up_secs < 0 )) && up_secs=0
+            fi
+        fi
         [ $first -eq 1 ] || printf ','; first=0
-        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s,"transport":"%s","remote":"%s"}' \
-            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}" "${transport}" "${remote}"
+        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s,"transport":"%s","remote":"%s","restarts":%s,"up_secs":%s,"hflaps":%s,"hage":%s}' \
+            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}" "${transport}" "${remote}" "${nrestarts}" "${up_secs}" "${hflaps:-0}" "${hage:-0}"
     done
     printf ']}\n'
+}
+
+# ===== SSL / TLS certificate acquisition (acme.sh) — driven by the panel "SSL" tab =====
+# Input via SSL_* env (validated by the panel). Emits JSON. Issued certs live under
+# $CERT_DIR/acme/<name>/{cert.crt,cert.key}; when SSL_MOVE_CORE=1 they are copied to the
+# pair the LEECH TLS transports read: $CERT_FILE (cert.crt) + $KEY_FILE (cert.key).
+ACME_HOME="/root/.acme.sh"; ACME="${ACME_HOME}/acme.sh"
+# marker holding the single cert name that is currently copied into the core path
+# ($CERT_FILE/$KEY_FILE). Only this cert re-copies to core on acme renewal, so multiple
+# certs can coexist on the node without a renewal fighting over the one served pair.
+ACTIVE_FILE="${CERT_DIR}/active"
+# acme.sh derives its store location from $HOME; the panel may exec this script locally with
+# HOME unset, which makes acme.sh --issue/--list look in the wrong place (empty results). This
+# script is root-only and always operates under /root, so pin HOME.
+export HOME="${HOME:-/root}"
+ssl_json_err() { echo "{\"ok\":false,\"error\":\"$1\"}"; }
+# classify a cert dir name → its method for display (ip-<addr> or a bare IPv4/IPv6 → ip; else domain)
+ssl_method_of() {
+    case "$1" in ip-*) echo ip; return 0 ;; esac
+    if [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$1" == *:*:* ]]; then echo ip; else echo domain; fi
+}
+
+ssl_install_acme() {
+    [[ -x "$ACME" ]] && return 0
+    # standalone HTTP-01 needs socat
+    if ! command -v socat >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+        timeout 180 sudo apt-get install -y socat >/dev/null 2>&1
+    fi
+    timeout 120 bash -c "curl -fsSL https://get.acme.sh | sh -s email=${SSL_EMAIL:-admin@leech.local}" >/dev/null 2>&1
+    [[ -x "$ACME" ]]
+}
+
+# copy an issued cert/key pair into the core's cert_files path, then restart ONLY the TLS
+# endpoints (wss/wssmux/anytls/https) so they pick up the new pair.
+ssl_move_to_core() {
+    local crt="$1" key="$2" u id2 t2
+    [[ -s "$crt" && -s "$key" ]] || return 1
+    mkdir -p "$CERT_DIR"
+    cp -f "$crt" "$CERT_FILE" && cp -f "$key" "$KEY_FILE" && chmod 600 "$KEY_FILE" || return 1
+    for u in $(systemctl list-units --plain --no-legend 'leech-iran*.service' 'leech-kharej*.service' 2>/dev/null | awk '{print $1}'); do
+        id2=$(sed -E 's/^leech-(.+)\.service$/\1/' <<< "$u")
+        t2=$(awk -F'"' '/^type = /{print $2; exit}' "${config_dir}/${id2}.toml" 2>/dev/null)
+        case "$t2" in wss|wssmux|anytls|https) systemctl restart "$u" >/dev/null 2>&1 ;; esac
+    done
+    return 0
+}
+
+# --ssl : issue a certificate. SSL_METHOD=http|dns|ip
+panel_ssl_issue() {
+    local method="${SSL_METHOD:-}" dom="${SSL_DOMAIN:-}" dir_acme crt key
+    case "$method" in
+        ip)
+            # REAL cert for a bare IP via acme.sh HTTP-01 standalone on a port (Let's Encrypt
+            # now issues short-lived IP certs), mirroring the http branch. Like 3x-ui.
+            local ip="${SSL_IP:-$SERVER_IP}"
+            [[ -n "$ip" ]] || { ssl_json_err "no IP address"; return 1; }
+            ssl_install_acme || { ssl_json_err "acme.sh install failed"; return 1; }
+            "$ACME" --set-default-ca --server "${SSL_CA:-letsencrypt}" >/dev/null 2>&1
+            dir_acme="${CERT_DIR}/acme/${ip}"; mkdir -p "$dir_acme"   # bare-IP name matches acme's <ip>_ecc store
+            crt="${dir_acme}/cert.crt"; key="${dir_acme}/cert.key"
+            local acmelog; acmelog=$(mktemp /tmp/leech-acme.XXXXXX 2>/dev/null || echo /tmp/leech-acme.$$)
+            timeout 200 "$ACME" --issue -d "$ip" --standalone --httpport "${SSL_PORT:-80}" --cert-profile shortlived --force >"$acmelog" 2>&1 \
+                || { ssl_json_err "IP issue failed: $(tail -n1 "$acmelog" 2>/dev/null | tr -cd '[:alnum:] .:_-')"; rm -f "$acmelog"; return 1; }
+            rm -f "$acmelog"
+            "$ACME" --install-cert -d "$ip" --key-file "$key" --fullchain-file "$crt" \
+                --reloadcmd "bash /root/leech/leech.sh --ssl-reload ${ip}" >/dev/null 2>&1 \
+                || { ssl_json_err "install-cert failed"; return 1; }
+            dom="$ip"
+            ;;
+        selfsigned)
+            # explicit fallback: a self-signed (browser-untrusted) cert for the IP, no CA / no port.
+            local ip="${SSL_IP:-$SERVER_IP}"
+            [[ -n "$ip" ]] || { ssl_json_err "no IP for self-signed cert"; return 1; }
+            dir_acme="${CERT_DIR}/acme/ip-${ip}"; mkdir -p "$dir_acme"
+            crt="${dir_acme}/cert.crt"; key="${dir_acme}/cert.key"
+            openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -x509 \
+                -days 3650 -sha256 -keyout "$key" -out "$crt" \
+                -subj "/CN=${ip}" -addext "subjectAltName=IP:${ip}" >/dev/null 2>&1 \
+                || { ssl_json_err "openssl self-sign failed"; return 1; }
+            dom="$ip"
+            ;;
+        http|dns)
+            [[ -n "$dom" ]] || { ssl_json_err "no domain for ${method} method"; return 1; }
+            ssl_install_acme || { ssl_json_err "acme.sh install failed"; return 1; }
+            "$ACME" --set-default-ca --server "${SSL_CA:-letsencrypt}" >/dev/null 2>&1
+            dir_acme="${CERT_DIR}/acme/${dom}"; mkdir -p "$dir_acme"
+            crt="${dir_acme}/cert.crt"; key="${dir_acme}/cert.key"
+            local acmelog; acmelog=$(mktemp /tmp/leech-acme.XXXXXX 2>/dev/null || echo /tmp/leech-acme.$$)
+            if [[ "$method" == "http" ]]; then
+                timeout 200 "$ACME" --issue -d "$dom" --standalone --httpport "${SSL_PORT:-80}" --force >"$acmelog" 2>&1 \
+                    || { ssl_json_err "issue failed: $(tail -n1 "$acmelog" 2>/dev/null | tr -cd '[:alnum:] .:_-')"; rm -f "$acmelog"; return 1; }
+            else
+                # provider creds (e.g. CF_Token) are already in the env, passed by the panel
+                timeout 200 "$ACME" --issue --dns "${SSL_DNS_PROVIDER:-dns_cf}" -d "$dom" --force >"$acmelog" 2>&1 \
+                    || { ssl_json_err "dns issue failed: $(tail -n1 "$acmelog" 2>/dev/null | tr -cd '[:alnum:] .:_-')"; rm -f "$acmelog"; return 1; }
+            fi
+            rm -f "$acmelog"
+            "$ACME" --install-cert -d "$dom" --key-file "$key" --fullchain-file "$crt" \
+                --reloadcmd "bash /root/leech/leech.sh --ssl-reload ${dom}" >/dev/null 2>&1 \
+                || { ssl_json_err "install-cert failed"; return 1; }
+            ;;
+        *) ssl_json_err "unknown SSL_METHOD (use http|dns|ip|selfsigned)"; return 1 ;;
+    esac
+    local moved=false exp name
+    name=$(basename "$dir_acme")
+    if [[ "${SSL_MOVE_CORE:-0}" == "1" ]] && ssl_move_to_core "$crt" "$key"; then
+        moved=true
+        printf '%s' "$name" > "$ACTIVE_FILE" 2>/dev/null   # this cert is now the single core-active one
+    fi
+    exp=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)
+    echo "{\"ok\":true,\"method\":\"${method}\",\"domain\":\"${dom}\",\"name\":\"${name}\",\"cert\":\"${crt}\",\"key\":\"${key}\",\"moved_to_core\":${moved},\"expires\":\"${exp}\"}"
+}
+
+# --ssl-list : enumerate ALL certs on this node (panel-installed copies + acme.sh's own store)
+# with on-disk cert/key paths, expiry, method and which one is core-active. emits {"certs":[...]}
+panel_ssl_list() {
+    local first=1 d name crt key exp method dom active="" md adir
+    declare -A seen
+    [[ -s "$ACTIVE_FILE" ]] && active=$(cat "$ACTIVE_FILE" 2>/dev/null)
+    printf '{"certs":['
+    shopt -s nullglob
+    # (a) certs the panel installed under cert_files/acme/<name>/
+    for d in "${CERT_DIR}"/acme/*/; do
+        name=$(basename "$d"); crt="${d}cert.crt"; key="${d}cert.key"
+        [[ -s "$crt" ]] || continue
+        seen[$name]=1
+        exp=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)
+        method=$(ssl_method_of "$name"); case "$name" in ip-*) dom="${name#ip-}" ;; *) dom="$name" ;; esac
+        [ $first -eq 1 ] || printf ','; first=0
+        printf '{"name":"%s","domain":"%s","method":"%s","cert":"%s","key":"%s","expires":"%s","active":%s}' \
+            "$name" "$dom" "$method" "$crt" "$key" "$exp" "$([ "$name" = "$active" ] && echo true || echo false)"
+    done
+    shopt -u nullglob
+    # (b) certs in acme.sh's own ECC store that were NOT installed into cert_files (issued
+    # outside the panel) — read the dirs directly. HOME-independent, unlike acme.sh --list.
+    shopt -s nullglob
+    for adir in "${ACME_HOME}"/*_ecc/; do
+        md=$(basename "$adir"); md="${md%_ecc}"
+        [[ -n "$md" && -z "${seen[$md]:-}" ]] || continue
+        crt="${adir}fullchain.cer"; key="${adir}${md}.key"
+        [[ -s "$crt" ]] || continue
+        exp=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)
+        method=$(ssl_method_of "$md")
+        [ $first -eq 1 ] || printf ','; first=0
+        printf '{"name":"%s","domain":"%s","method":"%s","cert":"%s","key":"%s","expires":"%s","active":%s}' \
+            "$md" "$md" "$method" "$crt" "$key" "$exp" "$([ "$md" = "$active" ] && echo true || echo false)"
+    done
+    shopt -u nullglob
+    printf ']}\n'
+}
+
+# --ssl-reload <name> : acme.sh reloadcmd target. Only the core-ACTIVE cert re-copies into the
+# served core pair; any other renewing cert just keeps its own acme/<name>/ copy (which acme
+# --install-cert already refreshed), so renewals never fight over the single served pair.
+panel_ssl_reload() {
+    local dom="${1:-}" active=""
+    [[ -n "$dom" ]] || { ssl_json_err "no domain"; return 1; }
+    [[ -s "$ACTIVE_FILE" ]] && active=$(cat "$ACTIVE_FILE" 2>/dev/null)
+    if [[ "$dom" == "$active" ]]; then
+        ssl_move_to_core "${CERT_DIR}/acme/${dom}/cert.crt" "${CERT_DIR}/acme/${dom}/cert.key" \
+            && echo "{\"ok\":true,\"reloaded\":\"${dom}\",\"core\":true}" || ssl_json_err "reload failed"
+    else
+        echo "{\"ok\":true,\"reloaded\":\"${dom}\",\"core\":false}"
+    fi
+}
+
+# --ssl-activate <name> : make an already-issued cert the SINGLE core-active one (no re-issue).
+# If the cert lives only in acme.sh's store (issued outside the panel), install it into
+# cert_files/acme/<name>/ first, then copy it into the core pair.
+panel_ssl_activate() {
+    local name="${1:-}" crt key adir
+    [[ -n "$name" ]] || { ssl_json_err "no cert name"; return 1; }
+    crt="${CERT_DIR}/acme/${name}/cert.crt"; key="${CERT_DIR}/acme/${name}/cert.key"
+    if [[ ! -s "$crt" && -x "$ACME" ]]; then
+        adir="${ACME_HOME}/${name}_ecc"
+        if [[ -s "${adir}/fullchain.cer" ]]; then
+            mkdir -p "${CERT_DIR}/acme/${name}"
+            "$ACME" --install-cert -d "$name" --key-file "$key" --fullchain-file "$crt" \
+                --reloadcmd "bash /root/leech/leech.sh --ssl-reload ${name}" >/dev/null 2>&1
+        fi
+    fi
+    [[ -s "$crt" && -s "$key" ]] || { ssl_json_err "cert not found: ${name}"; return 1; }
+    # write the marker ONLY after the copy succeeds, else the marker could point at a cert that
+    # isn't actually in the core pair and the next renewal would silently swap the served cert.
+    if ssl_move_to_core "$crt" "$key"; then
+        printf '%s' "$name" > "$ACTIVE_FILE" 2>/dev/null
+        echo "{\"ok\":true,\"active\":\"${name}\"}"
+    else
+        ssl_json_err "activate failed"
+    fi
+}
+
+# --ssl-delete <name> : remove an issued cert from the node (installed copy + acme renewal +
+# acme store). Refuses the core-active cert — deactivate/replace it first. name is allow-listed
+# by the panel (reCertName) before it ever reaches here.
+panel_ssl_delete() {
+    local name="${1:-}" active=""
+    [[ -n "$name" ]] || { ssl_json_err "no cert name"; return 1; }
+    [[ -s "$ACTIVE_FILE" ]] && active=$(cat "$ACTIVE_FILE" 2>/dev/null)
+    [[ "$name" == "$active" ]] && { ssl_json_err "cert is in use by the core; activate another first"; return 1; }
+    rm -rf "${CERT_DIR}/acme/${name}"
+    if [[ "$name" != ip-* && -x "$ACME" ]]; then
+        "$ACME" --remove -d "$name" >/dev/null 2>&1      # stop auto-renewal
+        rm -rf "${ACME_HOME}/${name}_ecc" "${ACME_HOME}/${name}"
+    fi
+    echo "{\"ok\":true,\"deleted\":\"${name}\"}"
 }
 
 case "${1:-}" in
@@ -1758,6 +2092,12 @@ case "${1:-}" in
     --rm)     panel_rm     "${2:?usage: --rm <type><port>}";        exit $? ;;
     --list)   panel_list;   exit $? ;;
     --stats)  panel_stats;  exit $? ;;
+    --tun-cleanup) tun_cleanup "${2:-}"; exit 0 ;;
+    --ssl)         panel_ssl_issue;          exit $? ;;
+    --ssl-list)    panel_ssl_list;           exit $? ;;
+    --ssl-reload)  panel_ssl_reload "${2:-}"; exit $? ;;
+    --ssl-activate) panel_ssl_activate "${2:-}"; exit $? ;;
+    --ssl-delete)  panel_ssl_delete "${2:-}"; exit $? ;;
 esac
 
 while true; do
