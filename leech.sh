@@ -151,12 +151,20 @@ download_and_extract_leech() {
     colorize yellow "    mkdir -p ${config_dir} && cp /path/to/leech ${config_dir}/leech"
     exit 1
 }
+# install a `leech` launcher so the operator can just type `leech` (from anywhere, incl. /root) to
+# open this configurator menu — instead of `bash /root/leech/leech.sh`. Idempotent.
+install_leech_cmd() {
+    local self; self="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null)"
+    [ -n "$self" ] && [ -f "$self" ] || self="$config_dir/leech.sh"
+    printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$self" > /usr/local/bin/leech 2>/dev/null && chmod +x /usr/local/bin/leech 2>/dev/null
+}
 # Non-interactive flag modes (--gen/--create/--rm/--list/--stats, used by the
 # leech-panel) skip the interactive load-time side effects (jq install, binary
 # download, ipwhois lookups, backup reconcile) — they add latency and can hang.
 if [[ "${1:-}" != --* ]]; then
     install_jq
     download_and_extract_leech
+    install_leech_cmd
 fi
 declare -A CONFIG
 reset_config() {
@@ -516,7 +524,11 @@ generate_toml_config() {
             echo ""
         elif [[ "$is_ipx" == "false" ]]; then
             echo "[dialer]"
-            echo "remote_addr = \"${CONFIG[remote_addr]}\""
+            if [[ -n "${CONFIG[remote_addrs]}" ]]; then
+                echo "remote_addrs = ${CONFIG[remote_addrs]}"
+            else
+                echo "remote_addr = \"${CONFIG[remote_addr]}\""
+            fi
             [[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = \"${CONFIG[edge_ip]}\""
             echo "dial_timeout = ${CONFIG[dial_timeout]}"
             echo "retry_interval = ${CONFIG[retry_interval]}"
@@ -852,6 +864,11 @@ gen_noninteractive() {
     CONFIG[transport_type]="${BH_TYPE:-tcp}"
     CONFIG[bind_addr]="${BH_BIND}"
     CONFIG[remote_addr]="${BH_REMOTE}"
+    # Multi-IP failover (ENHANCEMENT): BH_REMOTE_ADDRS is the COMPLETE comma-separated
+    # target list (include the primary, ideally first). When set it REPLACES remote_addr
+    # in the TOML — a non-empty remote_addr would make remote_addrs inert (CurrentRemote
+    # precedence). BH_REMOTE stays set for port derivation (tun name / unit name).
+    CONFIG[remote_addrs]="${BH_REMOTE_ADDRS:+$(csv_to_toml_array "$BH_REMOTE_ADDRS")}"
     CONFIG[edge_ip]="${BH_EDGE_IP}"
     CONFIG[dial_timeout]="${BH_DIAL_TIMEOUT:-10}"
     CONFIG[retry_interval]="${BH_RETRY:-3}"
