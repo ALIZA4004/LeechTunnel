@@ -1501,101 +1501,6 @@ EOF
     press_key
 }
 
-authorize_panel_key() { # $1 = pubkey line
-    local key="$1"
-    [ -z "$key" ] && return 1
-    mkdir -p /root/.ssh; chmod 700 /root/.ssh
-    touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys
-    grep -qF "$key" /root/.ssh/authorized_keys || echo "$key" >> /root/.ssh/authorized_keys
-}
-
-connect_to_panel() {
-    clear; colorize cyan "Connect this server to a LEECH panel (enroll as a node)" bold
-    colorize yellow "Both values are on this server's card in the panel."; echo
-    local pairfile="/etc/leech/panel.pair"
-    local url token name resp pubkey stored_url stored_tok
-    # Two questions, one per line, each naming exactly what to paste. The generic
-    # prompt_with_default helper is NOT used here: it prints a "[-]" prefix and a
-    # "(default: )" tail that say nothing, which is what made this screen unreadable.
-    echo -ne "\033[36m 1. Panel URL   \033[0m> "
-    IFS=$' \t\r\n' read -r url _
-    # Normalise what was typed. A trailing slash is the common one and it used to break
-    # enrollment outright: "$url/api/enroll" became "//api/enroll", which the panel answers
-    # with a 301 and an EMPTY body, so the script saw no JSON and blamed the address.
-    # A missing scheme is the other one — curl cannot use a bare host:port.
-    while [ -n "$url" ] && [ "${url%/}" != "$url" ]; do url="${url%/}"; done
-    case "$url" in http://*|https://*|"") ;; *) url="http://$url" ;; esac
-
-    # ---- manual fallback: no URL, just paste the panel's SSH public key directly ----
-    if [ -z "$url" ]; then
-        colorize yellow "No URL given — paste the panel's SSH public key instead, then Enter:"
-        local pubkey2; read -r pubkey2
-        pubkey2="${pubkey2%$'\r'}"
-        if authorize_panel_key "$pubkey2"; then
-            colorize green "✔ Panel key authorized — the panel can now control this node over SSH."
-        else
-            colorize red "no key given — nothing changed."
-        fi
-        [ -f "$config_dir/leech" ] || colorize yellow "Reminder: this node needs the LEECH core at $config_dir/leech for tunnels to run."
-        press_key; return
-    fi
-
-    # ---- token flow: paste the per-node token shown on the panel's node card ----
-    # The token is the whole credential — the panel admin password is deliberately NOT
-    # asked for, so it never travels from here to the panel in the clear.
-    echo -ne "\033[36m 2. Node token  \033[0m> "
-    IFS=$' \t\r\n' read -r token _
-    [ -z "$token" ] && { colorize red "token is required"; press_key; return; }
-
-    # pairing lock: once paired, refuse to enroll into a *different* panel/token so no
-    # second panel can hijack this node. Re-running with the same panel+token is fine.
-    if [ -f "$pairfile" ]; then
-        stored_url=$(awk 'NR==1{print $1}' "$pairfile"); stored_tok=$(awk 'NR==1{print $2}' "$pairfile")
-        if [ "$stored_tok" != "$token" ] || [ "$stored_url" != "$url" ]; then
-            colorize red "This node is already paired to a panel: $stored_url"
-            colorize yellow "To move it to a different panel, first run:  rm -f $pairfile"
-            colorize yellow "and remove the old panel key from /root/.ssh/authorized_keys."
-            press_key; return
-        fi
-    fi
-
-    # Capture the HTTP status alongside the body, so a non-JSON reply (redirect, proxy
-    # error page, wrong port answering) can be reported as what it actually was instead of
-    # being flattened into "no response".
-    local raw code err
-    raw=$(curl -s -w $'\n%{http_code}' --max-time 10 -X POST -H 'Content-Type: application/json' \
-          -d "{\"token\":\"$token\"}" "$url/api/enroll")
-    code="${raw##*$'\n'}"
-    resp="${raw%$'\n'*}"
-    if ! echo "$resp" | grep -q '"ok":true'; then
-        # strip backslashes: the panel escapes quotes inside its message, and a trailing
-        # backslash would swallow the colour reset in colorize (echo -e) and stain the
-        # rest of the screen red.
-        err=$(echo "$resp" | grep -oP '"error":"\K[^"]+' | tr -d '\\')
-        if [ -z "$err" ]; then
-            case "$code" in
-                000|"") err="could not reach $url — check the address, the port, and that the panel is running" ;;
-                3*)     err="$url answered HTTP $code (a redirect) — check the address has no extra path" ;;
-                *)      err="$url answered HTTP $code but not with a panel reply — is that really the panel port?" ;;
-            esac
-        fi
-        colorize red "Enrollment failed: $err"
-        colorize yellow "Add this node in the panel (Nodes → Enroll node) and paste its exact token."
-        press_key; return
-    fi
-
-    name=$(echo "$resp" | grep -oP '"name":"\K[^"]+')
-    pubkey=$(echo "$resp" | grep -oP '"pubkey":"\K[^"]+')
-    if authorize_panel_key "$pubkey"; then
-        mkdir -p /etc/leech; printf '%s %s\n' "$url" "$token" > "$pairfile"; chmod 600 "$pairfile"
-        colorize green "✔ Paired with the panel and authorized — it now controls this node as '$name'."
-    else
-        colorize red "the panel did not return its SSH key — enrollment incomplete."
-    fi
-    [ -f "$config_dir/leech" ] || colorize yellow "Reminder: this node needs the LEECH core at $config_dir/leech for tunnels to run."
-    press_key
-}
-
 # Replace the panel binary in place. The running binary's file is busy, so the new
 # one lands under a temp name and is swapped while the service is stopped; the old
 # build is kept as .bak so a bad download can be rolled back.
@@ -1628,6 +1533,24 @@ update_panel() {
     fi
     press_key
 }
+change_panel_password() {
+    if [ ! -f /etc/leech-panel/config.json ]; then colorize red "no panel is installed on this server"; press_key; return; fi
+    local pw pw2
+    read -rsp " New panel password: " pw; echo
+    read -rsp " Confirm password: " pw2; echo
+    if [ "$pw" != "$pw2" ]; then colorize red "passwords do not match"; press_key; return; fi
+    if [ ${#pw} -lt 6 ]; then colorize red "password too short (min 6)"; press_key; return; fi
+    local sha; sha=$(printf '%s' "$pw" | sha256sum | awk '{print $1}')
+    install_jq
+    if jq --arg s "$sha" '.admin_password_sha256=$s' /etc/leech-panel/config.json > /etc/leech-panel/config.json.tmp 2>/dev/null && [ -s /etc/leech-panel/config.json.tmp ]; then
+        mv -f /etc/leech-panel/config.json.tmp /etc/leech-panel/config.json; chmod 600 /etc/leech-panel/config.json
+        systemctl restart leech-panel 2>/dev/null
+        colorize green "✔ panel password updated"
+    else
+        rm -f /etc/leech-panel/config.json.tmp; colorize red "failed to update the config"
+    fi
+    press_key
+}
 configure_panel() {
     while true; do
         clear; display_logo; echo
@@ -1636,7 +1559,7 @@ configure_panel() {
         echo -e " Status: $st"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         colorize green " 1. Install panel (become the control hub)" bold
-        colorize magenta " 2. Connect this server to a panel (enroll node)" bold
+        colorize magenta " 2. Change panel password" bold
         echo " 3. Panel status / logs"
         echo " 4. Update panel to the latest build"
         echo " 5. Remove panel"
@@ -1645,7 +1568,7 @@ configure_panel() {
         local ch; read -r -p "Choice [0-5]: " ch
         case $ch in
             1) install_panel ;;
-            2) connect_to_panel ;;
+            2) change_panel_password ;;
             3) systemctl status leech-panel --no-pager 2>&1 | head -12; echo; journalctl -u leech-panel -n 15 --no-pager 2>/dev/null; press_key ;;
             4) update_panel ;;
             5) systemctl disable --now leech-panel 2>/dev/null; rm -f /etc/systemd/system/leech-panel.service; systemctl daemon-reload 2>/dev/null; colorize green "panel removed"; press_key ;;
