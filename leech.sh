@@ -2011,20 +2011,53 @@ panel_ssl_activate() {
     fi
 }
 
-# --ssl-delete <name> : remove an issued cert from the node (installed copy + acme renewal +
-# acme store). Refuses the core-active cert — deactivate/replace it first. name is allow-listed
-# by the panel (reCertName) before it ever reaches here.
+# --ssl-delete <name> [force] : remove an issued cert from the node (installed copy + acme renewal +
+# acme store). The core-active cert is refused UNLESS force is given — otherwise the LAST remaining
+# cert can never be removed (there is nothing else to activate first, so the operator is stuck).
+# Forcing also clears the served core pair and the active marker; the TLS transports then fall back
+# to their built-in self-signed cert the next time they restart. name is allow-listed by the panel
+# (reCertName) before it ever reaches here.
 panel_ssl_delete() {
-    local name="${1:-}" active=""
+    local name="${1:-}" force="${2:-}" active="" wascore=false
     [[ -n "$name" ]] || { ssl_json_err "no cert name"; return 1; }
     [[ -s "$ACTIVE_FILE" ]] && active=$(cat "$ACTIVE_FILE" 2>/dev/null)
-    [[ "$name" == "$active" ]] && { ssl_json_err "cert is in use by the core; activate another first"; return 1; }
+    if [[ "$name" == "$active" ]]; then
+        [[ "$force" == "force" ]] || { ssl_json_err "cert is in use by the core; activate another first, or delete it with force"; return 1; }
+        wascore=true
+        rm -f "$CERT_FILE" "$KEY_FILE" "$ACTIVE_FILE"
+    fi
     rm -rf "${CERT_DIR}/acme/${name}"
     if [[ "$name" != ip-* && -x "$ACME" ]]; then
         "$ACME" --remove -d "$name" >/dev/null 2>&1      # stop auto-renewal
         rm -rf "${ACME_HOME}/${name}_ecc" "${ACME_HOME}/${name}"
     fi
-    echo "{\"ok\":true,\"deleted\":\"${name}\"}"
+    echo "{\"ok\":true,\"deleted\":\"${name}\",\"was_core\":${wascore}}"
+}
+
+# --ssl-renew <name> : re-issue an EXISTING cert through acme.sh (no new form, no new domain) and,
+# when it is the core-active one, re-copy it into the served pair and restart the TLS tunnels. Use
+# this instead of filling the issue form again: acme.sh reuses the stored account/challenge method,
+# so it does not burn a "duplicate certificate" allowance the way a fresh --issue can.
+panel_ssl_renew() {
+    local name="${1:-}" active="" crt key
+    [[ -n "$name" ]] || { ssl_json_err "no cert name"; return 1; }
+    [[ -x "$ACME" ]] || { ssl_json_err "acme.sh is not installed on this node"; return 1; }
+    [[ "$name" == ip-* ]] && { ssl_json_err "a self-signed cert cannot be renewed - issue a new one"; return 1; }
+    [[ -d "${ACME_HOME}/${name}_ecc" || -d "${ACME_HOME}/${name}" ]] || { ssl_json_err "no acme record for ${name} on this node"; return 1; }
+    local rlog; rlog=$(mktemp /tmp/leech-renew.XXXXXX 2>/dev/null || echo /tmp/leech-renew.$$)
+    timeout 200 "$ACME" --renew -d "$name" --force >"$rlog" 2>&1 \
+        || { ssl_json_err "renew failed: $(tail -n1 "$rlog" 2>/dev/null | tr -cd '[:alnum:] .:_-')"; rm -f "$rlog"; return 1; }
+    rm -f "$rlog"
+    crt="${CERT_DIR}/acme/${name}/cert.crt"; key="${CERT_DIR}/acme/${name}/cert.key"
+    mkdir -p "${CERT_DIR}/acme/${name}"
+    "$ACME" --install-cert -d "$name" --key-file "$key" --fullchain-file "$crt" \
+        --reloadcmd "bash /root/leech/leech.sh --ssl-reload ${name}" >/dev/null 2>&1 \
+        || { ssl_json_err "install-cert failed"; return 1; }
+    [[ -s "$ACTIVE_FILE" ]] && active=$(cat "$ACTIVE_FILE" 2>/dev/null)
+    local recopied=false
+    if [[ "$name" == "$active" ]] && ssl_move_to_core "$crt" "$key"; then recopied=true; fi
+    local exp; exp=$(openssl x509 -enddate -noout -in "$crt" 2>/dev/null | cut -d= -f2)
+    echo "{\"ok\":true,\"renewed\":\"${name}\",\"core\":${recopied},\"expires\":\"${exp}\"}"
 }
 
 case "${1:-}" in
@@ -2037,7 +2070,8 @@ case "${1:-}" in
     --ssl-list)    panel_ssl_list;           exit $? ;;
     --ssl-reload)  panel_ssl_reload "${2:-}"; exit $? ;;
     --ssl-activate) panel_ssl_activate "${2:-}"; exit $? ;;
-    --ssl-delete)  panel_ssl_delete "${2:-}"; exit $? ;;
+    --ssl-delete)  panel_ssl_delete "${2:-}" "${3:-}"; exit $? ;;
+    --ssl-renew)   panel_ssl_renew  "${2:-}"; exit $? ;;
 esac
 
 while true; do
