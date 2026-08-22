@@ -178,6 +178,10 @@ prompt_connection_section() {
         if [[ -n "${CONFIG[bind_addr]}" && "${CONFIG[bind_addr]}" != *:* ]]; then
             CONFIG[bind_addr]=":${CONFIG[bind_addr]}"
         fi
+        # ENHANCEMENT — additional bind addresses (multi-bind). Optional; CSV -> TOML array.
+        echo -ne "[-] Additional bind addresses (CSV, optional, Enter to skip): "
+        read -r _bind_addrs_csv
+        [[ -n "$_bind_addrs_csv" ]] && CONFIG[bind_addrs]="$(csv_to_toml_array "$_bind_addrs_csv")"
     else
         while true; do
             echo -ne "[*] IRAN Server Address [IP:Port] or [Domain:Port]: "
@@ -197,6 +201,12 @@ prompt_connection_section() {
             echo -ne "[-] Edge IP/Domain (optional, press Enter to skip): "
             read -r CONFIG[edge_ip]
         fi
+        # ENHANCEMENT — client source-address bind (dialer.local_addr / local_addrs). Optional.
+        echo -ne "[-] Local source address (optional, Enter to skip): "
+        read -r CONFIG[local_addr]
+        echo -ne "[-] Local source addresses (CSV, optional, Enter to skip): "
+        read -r _local_addrs_csv
+        [[ -n "$_local_addrs_csv" ]] && CONFIG[local_addrs]="$(csv_to_toml_array "$_local_addrs_csv")"
         CONFIG[dial_timeout]="10"
         CONFIG[retry_interval]="3"
     fi
@@ -213,10 +223,17 @@ is_valid_algorithm() {
     return 1
 }
 prompt_security_section() {
-    local is_ipx="$1"
+    local is_ipx="$1"                 # is_rawl3: raw-L3 carriers use the encryption+PSK branch
+    local mandate_enc="${2:-false}"   # icmpx/udpx MANDATE encryption (the core rejects enc-off / a
+                                      # PSK-less icmpx at Validate) — force it on, no prompt. ipx stays optional.
     colorize blue "━━━ Security Configuration ━━━" bold
     if [[ "$is_ipx" == "true" ]]; then
-        prompt_boolean "Enable Encryption" "true" CONFIG[enable_encryption]
+        if [[ "$mandate_enc" == "true" ]]; then
+            colorize magenta "This carrier requires payload encryption — enabling it (mandatory)." normal
+            CONFIG[enable_encryption]="true"
+        else
+            prompt_boolean "Enable Encryption" "true" CONFIG[enable_encryption]
+        fi
         if [[ "${CONFIG[enable_encryption]}" == "true" ]]; then
             echo
             while true; do
@@ -231,6 +248,9 @@ prompt_security_section() {
             done
             prompt_with_default "PSK (32-char base64)" "pN9m6m0tH3nE3V8xKZ6Lq5yYcW2K1S7QG9u4cF0A8M4=" CONFIG[psk]
             prompt_with_default "KDF Iterations" "100000" CONFIG[kdf_iterations]
+            # v3: directional AEAD keys — derive SEPARATE up/down keys (needs aead_harden, which is
+            # implicit/forced for udpx/icmpx). Wire-changing => MUST be identical on BOTH ends.
+            prompt_boolean "Directional AEAD keys (separate up/down; needs aead_harden) [BOTH ends match]" "false" CONFIG[aead_dir_keys]
         fi
     else
         prompt_with_default "Security Token" "your_token" CONFIG[token]
@@ -253,7 +273,7 @@ prompt_transport_section() {
     done
     if [[ "${CONFIG[transport_type]}" == "tun" ]]; then
         echo
-        local encapsulations=(tcp ipx)
+        local encapsulations=(tcp ipx icmpx udpx)
         echo "Available encapsulations:"
         printf '  • %s\n' "${encapsulations[@]}"
         while true; do
@@ -264,9 +284,12 @@ prompt_transport_section() {
         done
     fi
     echo
-    if [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]]; then
-        is_ipx="true"
-    fi
+    # ipx, icmpx and udpx are socketless raw-L3 carriers: the TCP-socket prompts below
+    # (nodelay, proxy_protocol, keepalive, acceleration) apply to none of them, so this
+    # local gates them all off. configure_server re-derives the specific encapsulation.
+    case "${CONFIG[tun_encapsulation]}" in
+        ipx|icmpx|udpx) is_ipx="true" ;;
+    esac
     if [[ "$is_ipx" != "true" ]]; then
         prompt_boolean "Enable TCP_NODELAY" "true" CONFIG[nodelay]
     fi
@@ -315,6 +338,8 @@ prompt_mux_section() {
     colorize blue "━━━ Mux Configuration ━━━" bold
     prompt_with_default "Mux Version [1 or 2]" "2" CONFIG[mux_version]
     prompt_with_default "Mux Concurrency" "8" CONFIG[mux_concurrency]
+    # Hedioum-port: per-session keepalive-interval jitter (removes the fixed inter-NOP DPI clock).
+    prompt_boolean "Randomize mux keepalive interval per session (mux_keepalive_jitter)" "false" CONFIG[mux_keepalive_jitter]
     CONFIG[mux_framesize]="32768"
     CONFIG[mux_recievebuffer]="4194304"
     CONFIG[mux_streambuffer]="2097152"
@@ -415,6 +440,9 @@ prompt_tuning_section() {
         prompt_with_default "Buffer Profile" "balanced" CONFIG[buffer_profile]
         prompt_with_default "Read Timeout" "120" CONFIG[read_timeout]
     fi
+    # v3: carrier-level egress pacer (ALL transports; one-end/local timing, no wire change). Paces the whole
+    # carrier just below a measured path-policer cliff. 0 = off (byte/timing-identical).
+    prompt_with_default "Egress pace Mbps (0 = off; carrier-level throughput cap)" "0" CONFIG[rate_mbps]
     echo ""
 }
 prompt_logging_section() {
@@ -438,10 +466,12 @@ prompt_ports_section() {
     if [[ "$is_tun" != "true" ]]; then
         colorize blue "━━━ Port Mapping Configuration ━━━" bold
         colorize green "Supported formats:"
-        echo "  1. 443           - Listen on 443, forward to 443"
-        echo "  2. 443=5000      - Listen on 443, forward to 5000"
-        echo "  3. 443-600       - Listen on range 443-600"
-        echo "  4. 443-600:5201  - Range forwarding to 5201"
+        echo "  1. 443              - Listen on 443, forward to 443"
+        echo "  2. 443=5000         - Listen on 443, forward to 5000"
+        echo "  3. 443-600          - Listen on range 443-600"
+        echo "  4. 443-600:5201     - Range forwarding to 5201"
+        echo "  5. 443=1.2.3.4:5201 - Forward to a REMOTE host:port (the peer dials it —"
+        echo "                        e.g. an onward/filtered box the far side can reach)"
         echo ""
         echo -ne "Enter port mappings (comma-separated): "
         read -r CONFIG[ports_mapping]
@@ -512,23 +542,66 @@ prompt_ipx_section() {
     [[ -n "${CONFIG[ipx_allowed_raw]}" ]] && CONFIG[ipx_allowed_client_ips]="$(csv_to_toml_array "${CONFIG[ipx_allowed_raw]}")"
     echo ""
 }
+# icmpx / udpx addressing (mirrors prompt_ipx_section for the other two raw-L3 carriers).
+# Both are socketless: role comes from [<encap>].mode, and each end names its OWN public IP
+# (listen_ip) and the PEER's (dst_ip). The wire-changing knobs (id/obfs/gso/hop/…) keep the
+# core's defaults here; the panel's --gen path exposes them for power users. udpx also needs a
+# shared wire port (identical on both ends). Encryption+PSK come from prompt_security_section.
+prompt_icmpx_udpx_section() {
+    local encap="$1"   # icmpx | udpx
+    local mode="$2"    # server | client
+    [[ "$encap" != "icmpx" && "$encap" != "udpx" ]] && return
+    colorize blue "━━━ ${encap^^} Configuration ━━━" bold
+    CONFIG["${encap}_mode"]="$mode"
+    prompt_with_default "Listen IP (this node's own public IP)" "$SERVER_IP" "CONFIG[${encap}_listen_ip]"
+    while :; do
+        prompt_with_default "Destination IP (the peer node's public IP)" "" "CONFIG[${encap}_dst_ip]"
+        [[ -n "${CONFIG[${encap}_dst_ip]}" ]] && break
+        colorize red "Destination IP cannot be empty."
+    done
+    if [[ "$encap" == "udpx" ]]; then
+        # port MUST be identical on BOTH ends (both bind + target it); default 40000.
+        prompt_with_default "UDP wire port (identical on both ends)" "40000" "CONFIG[udpx_port]"
+        # v3: client-only, LOCAL/one-end cover burst + make-before-break source-port rotation.
+        if [[ "$mode" == "client" ]]; then
+            prompt_with_default "Flow-start cover datagrams (udpx_junk; 0 = off)" "0" "CONFIG[udpx_junk]"
+            prompt_boolean "Rotate UDP source port (make-before-break; NOT with hop_ports)" "false" "CONFIG[udp_rotate]"
+            [[ "${CONFIG[udp_rotate]}" == "true" ]] && prompt_with_default "  ↳ Rotation interval seconds" "45" "CONFIG[udp_rotate_interval]"
+        fi
+    elif [[ "$encap" == "icmpx" ]]; then
+        # v3: client-only, LOCAL/one-end flow-start cover burst.
+        if [[ "$mode" == "client" ]]; then
+            prompt_with_default "Flow-start cover packets (icmpx_junk; 0 = off)" "0" "CONFIG[icmpx_junk]"
+        fi
+    fi
+    echo ""
+}
 generate_toml_config() {
     local mode="$1"
     local output_file="$2"
     local is_tun="$3"
     local is_ipx="$4"
+    local is_icmpx="${5:-false}"
+    local is_udpx="${6:-false}"
+    # ipx, icmpx and udpx are socketless raw-L3 carriers: role comes from [ipx]/[icmpx]/[udpx].mode,
+    # NOT a [listener]/[dialer], and they share the ipx-style [security] block (PSK/AEAD, no token).
+    local is_rawl3="false"
+    [[ "$is_ipx" == "true" || "$is_icmpx" == "true" || "$is_udpx" == "true" ]] && is_rawl3="true"
     {
-        if [[ "$mode" == "server" ]] && [[ "$is_ipx" == "false" ]]; then
+        if [[ "$mode" == "server" ]] && [[ "$is_rawl3" == "false" ]]; then
             echo "[listener]"
             echo "bind_addr = \"${CONFIG[bind_addr]}\""
+            [[ -n "${CONFIG[bind_addrs]}" ]] && echo "bind_addrs = ${CONFIG[bind_addrs]}"
             echo ""
-        elif [[ "$is_ipx" == "false" ]]; then
+        elif [[ "$is_rawl3" == "false" ]]; then
             echo "[dialer]"
             if [[ -n "${CONFIG[remote_addrs]}" ]]; then
                 echo "remote_addrs = ${CONFIG[remote_addrs]}"
             else
                 echo "remote_addr = \"${CONFIG[remote_addr]}\""
             fi
+            [[ -n "${CONFIG[local_addr]}" ]]  && echo "local_addr = \"${CONFIG[local_addr]}\""
+            [[ -n "${CONFIG[local_addrs]}" ]] && echo "local_addrs = ${CONFIG[local_addrs]}"
             [[ -n "${CONFIG[edge_ip]}" ]] && echo "edge_ip = \"${CONFIG[edge_ip]}\""
             echo "dial_timeout = ${CONFIG[dial_timeout]}"
             echo "retry_interval = ${CONFIG[retry_interval]}"
@@ -553,7 +626,10 @@ generate_toml_config() {
         if [[ "$accel" != "false" ]]; then
             # BBR: DPI-invisible congestion control (~55x faster under loss, neutral on a
             # clean link). Every TCP-family carrier — NOT the raw ipx engine. Empty => skip.
-            if [[ "$is_ipx" != "true" ]]; then
+            # Every TCP-family carrier — NOT any raw-L3 engine (ipx/icmpx/udpx have no TCP socket,
+            # and the panel/--gen path blanks CONFIG[congestion] for all three; gate on is_rawl3 so
+            # the interactive path matches it and never writes a stray congestion= for icmpx/udpx).
+            if [[ "$is_rawl3" != "true" ]]; then
                 local cc="${CONFIG[congestion]-bbr}"
                 [[ -n "$cc" ]] && echo "congestion = \"$cc\""
             fi
@@ -581,6 +657,11 @@ generate_toml_config() {
         [[ -n "${CONFIG[adaptive_probe]}" ]]          && echo "adaptive_probe = ${CONFIG[adaptive_probe]}"
         [[ -n "${CONFIG[adaptive_probe_interval]}" ]] && echo "adaptive_probe_interval = ${CONFIG[adaptive_probe_interval]}"
         [[ -n "${CONFIG[adaptive_probe_fails]}" ]]    && echo "adaptive_probe_fails = ${CONFIG[adaptive_probe_fails]}"
+        # ENHANCEMENT — health-scored exit steering (client; needs 2+ exits). Empty => key omitted => off.
+        [[ -n "${CONFIG[health_failover]}" ]]         && echo "health_failover = ${CONFIG[health_failover]}"
+        [[ -n "${CONFIG[health_probe_interval]}" ]]   && echo "health_probe_interval = ${CONFIG[health_probe_interval]}"
+        # ENHANCEMENT — in-band throttle/stall failover (client; kernel TCP_INFO; mux-TCP). Empty => key omitted => off.
+        [[ -n "${CONFIG[inband_failover]}" ]]         && echo "inband_failover = ${CONFIG[inband_failover]}"
         # --- Dagger-fusion Stage-1 ENHANCEMENTS (opt-in; empty => key omitted, faithful default) ---
         # tls_fragment: split the ClientHello across TCP segments (anti-SNI-reassembly; wss/wssmux/anytls).
         # probe_decoy: unauth prober of a raw tcp/kcp port gets a fake nginx 200 instead of a tunnel tell.
@@ -591,7 +672,30 @@ generate_toml_config() {
         # Stage-4: obfs_padding (noise record padding, tcp/tcpmux) + tls_fingerprint (anytls uTLS
         # profile: empty=browser utls, "go"=stock crypto/tls). Both are [transport] fields.
         [[ -n "${CONFIG[obfs_padding]}" ]]    && echo "obfs_padding = ${CONFIG[obfs_padding]}"
+        # obfs_fake_tls: frame Noise records as TLS 1.2 app-data (17 03 03) vs a stateless FEP DPI. Both ends.
+        [[ -n "${CONFIG[obfs_fake_tls]}" ]]   && echo "obfs_fake_tls = ${CONFIG[obfs_fake_tls]}"
         [[ -n "${CONFIG[tls_fingerprint]}" ]] && echo "tls_fingerprint = \"${CONFIG[tls_fingerprint]}\""
+        # --- Hedioum-port ENHANCEMENTS (opt-in; empty => key omitted, faithful default off) ---
+        # decoy_identity: per-install token-seeded decoy persona (Server/ETag/Last-Modified) across the
+        #   probe_decoy 200, ws fake-site and http/https mimicry — kills the fleet-wide decoy signature.
+        [[ -n "${CONFIG[decoy_identity]}" ]]    && echo "decoy_identity = ${CONFIG[decoy_identity]}"
+        # tls_auth_bind: channel-bind the token to the live TLS leaf cert (HMAC, never on wire) —
+        #   wss/wssmux/anytls; BOTH ends. _fp = 64-hex escape for an intended TLS terminator.
+        [[ -n "${CONFIG[tls_auth_bind]}" ]]     && echo "tls_auth_bind = ${CONFIG[tls_auth_bind]}"
+        [[ -n "${CONFIG[tls_auth_bind_fp]}" ]]  && echo "tls_auth_bind_fp = \"${CONFIG[tls_auth_bind_fp]}\""
+        # mail_mimic: plaintext SMTP/IMAP + STARTTLS prologue before TLS (wss/wssmux/anytls); BOTH ends.
+        [[ -n "${CONFIG[mail_mimic]}" ]]        && echo "mail_mimic = \"${CONFIG[mail_mimic]}\""
+        # relay_shape: per-connection token-bucket rate cap on the forwarder relay (local; no both-ends).
+        [[ -n "${CONFIG[relay_shape]}" ]]       && echo "relay_shape = ${CONFIG[relay_shape]}"
+        [[ -n "${CONFIG[relay_base_mbps]}" ]]   && echo "relay_base_mbps = ${CONFIG[relay_base_mbps]}"
+        [[ -n "${CONFIG[relay_jitter_mbps]}" ]] && echo "relay_jitter_mbps = ${CONFIG[relay_jitter_mbps]}"
+        [[ -n "${CONFIG[relay_burst_bytes]}" ]] && echo "relay_burst_bytes = ${CONFIG[relay_burst_bytes]}"
+        [[ -n "${CONFIG[relay_reroll_secs]}" ]] && echo "relay_reroll_secs = ${CONFIG[relay_reroll_secs]}"
+        # v3: rate_mbps (carrier-level egress pacer, ALL transports, one-end/local timing — no wire change);
+        # tcp_rotate + interval (proactive client TCP-stream rotation). Empty => key omitted => byte/timing-off.
+        [[ -n "${CONFIG[rate_mbps]}" ]]           && echo "rate_mbps = ${CONFIG[rate_mbps]}"
+        [[ -n "${CONFIG[tcp_rotate]}" ]]          && echo "tcp_rotate = ${CONFIG[tcp_rotate]}"
+        [[ -n "${CONFIG[tcp_rotate_interval]}" ]] && echo "tcp_rotate_interval = ${CONFIG[tcp_rotate_interval]}"
         echo ""
         if [[ "$is_tun" == "true" ]]; then
             echo "[tun]"
@@ -603,7 +707,66 @@ generate_toml_config() {
             echo "mtu = ${CONFIG[tun_mtu]}"
             # Stage-4: outer_auth (tun/tcp ONLY — tun/ipx has no outer stream). Token handshake on
             # the outer conn; must be set on BOTH ends. Default off omits the key (faithful raw relay).
-            [[ "${CONFIG[tun_encapsulation]}" != "ipx" && -n "${CONFIG[tun_outer_auth]}" ]] && echo "outer_auth = ${CONFIG[tun_outer_auth]}"
+            # outer_auth is a tun/tcp-only outer-stream token; no raw-L3 carrier (ipx/icmpx/udpx) has an
+            # outer stream, so key off is_rawl3 rather than naming each encapsulation.
+            [[ "$is_rawl3" == "false" && -n "${CONFIG[tun_outer_auth]}" ]] && echo "outer_auth = ${CONFIG[tun_outer_auth]}"
+            echo ""
+        fi
+        if [[ "$is_icmpx" == "true" ]]; then
+            echo "[icmpx]"
+            echo "mode = \"${CONFIG[icmpx_mode]}\""
+            echo "listen_ip = \"${CONFIG[icmpx_listen_ip]}\""
+            echo "dst_ip = \"${CONFIG[icmpx_dst_ip]}\""
+            # Wire-changing knobs — MUST be identical on BOTH ends (the writer emits the same
+            # values to each side). Empty => key omitted => the core's default (mimic_ping on,
+            # suppress on, kernel_filter on, id derived from the PSK, no rotation).
+            [[ -n "${CONFIG[icmpx_id_pool]}" ]]       && echo "id_pool = ${CONFIG[icmpx_id_pool]}"
+            [[ -n "${CONFIG[icmpx_id]}" ]]            && echo "id = ${CONFIG[icmpx_id]}"
+            [[ -n "${CONFIG[icmpx_id_rotate_sec]}" ]] && echo "id_rotate_sec = ${CONFIG[icmpx_id_rotate_sec]}"
+            [[ -n "${CONFIG[icmpx_mimic_ping]}" ]]    && echo "mimic_ping = ${CONFIG[icmpx_mimic_ping]}"
+            [[ -n "${CONFIG[icmpx_readers]}" ]]       && echo "readers = ${CONFIG[icmpx_readers]}"
+            [[ -n "${CONFIG[icmpx_batch]}" ]]         && echo "batch = ${CONFIG[icmpx_batch]}"
+            [[ -n "${CONFIG[icmpx_suppress]}" ]]      && echo "suppress = ${CONFIG[icmpx_suppress]}"
+            [[ -n "${CONFIG[icmpx_kernel_filter]}" ]] && echo "kernel_filter = ${CONFIG[icmpx_kernel_filter]}"
+            # P6a passive in-band DPI/health observer (true|false). Observe-ONLY (no wire bytes) => need NOT
+            # match the peer. Empty => off.
+            [[ -n "${CONFIG[icmpx_dpi_observe]}" ]]   && echo "dpi_observe = ${CONFIG[icmpx_dpi_observe]}"
+            # v3 icmpx_junk — flow-start cover burst of sealed 1-byte fillers (client/one-end, LOCAL — no
+            # peer match). Empty => key omitted => off.
+            [[ -n "${CONFIG[icmpx_junk]}" ]]          && echo "icmpx_junk = ${CONFIG[icmpx_junk]}"
+            echo ""
+        fi
+        if [[ "$is_udpx" == "true" ]]; then
+            echo "[udpx]"
+            echo "mode = \"${CONFIG[udpx_mode]}\""
+            echo "listen_ip = \"${CONFIG[udpx_listen_ip]}\""
+            echo "dst_ip = \"${CONFIG[udpx_dst_ip]}\""
+            # port MUST match on BOTH ends (both bind + target it); written unconditionally so an
+            # omitted port can never become a silent :0 bind (the core rejects port 0 at Validate).
+            echo "port = ${CONFIG[udpx_port]}"
+            [[ -n "${CONFIG[udpx_readers]}" ]] && echo "readers = ${CONFIG[udpx_readers]}"
+            [[ -n "${CONFIG[udpx_batch]}" ]]   && echo "batch = ${CONFIG[udpx_batch]}"
+            # P3/P3c obfs (none|quic|quic2|dtls). quic/quic2 = QUIC short-header mimic; dtls = DTLS 1.2 record
+            # mimic (WebRTC/DTLS-SRTP, for QUIC-throttled links). Wire-changing — MUST match on BOTH ends (the
+            # writer emits the same value to each). Empty => omitted => off (plain P4a datagram).
+            [[ -n "${CONFIG[udpx_obfs]}" ]]    && echo "obfs = \"${CONFIG[udpx_obfs]}\""
+            # P2 UDP GSO/GRO offload (true|false). Wire-INVISIBLE (below-IP segmentation) → need NOT match the
+            # peer; best-effort with a sendmmsg/recvmmsg fallback. Empty => omitted => off.
+            [[ -n "${CONFIG[udpx_gso]}" ]]     && echo "gso = ${CONFIG[udpx_gso]}"
+            # P5 keyed port-hopping. hop_ports = CSV/ranges (e.g. "40000-40007"); the schedule MUST match on
+            # BOTH ends (the writer emits the same value to each), [udpx].port must be a member, and the WHOLE
+            # set must be firewall-open on both ends. Empty => omitted => off.
+            [[ -n "${CONFIG[udpx_hop_ports]}" ]]    && echo "hop_ports = \"${CONFIG[udpx_hop_ports]}\""
+            [[ -n "${CONFIG[udpx_hop_interval]}" ]] && echo "hop_interval = ${CONFIG[udpx_hop_interval]}"
+            # P6a passive in-band DPI/health observer (true|false). Observe-ONLY (logs blackhole/throttle/
+            # recovery from local counters) — NO wire bytes, so it need NOT match the peer. Empty => off.
+            [[ -n "${CONFIG[udpx_dpi_observe]}" ]]  && echo "dpi_observe = ${CONFIG[udpx_dpi_observe]}"
+            # v3: udpx_junk (client flow-start cover datagrams; one-end, LOCAL) + udp_rotate/interval
+            # (client make-before-break source-port rotation; mutually exclusive with hop_ports). Empty =>
+            # key omitted => byte/timing-identical off.
+            [[ -n "${CONFIG[udpx_junk]}" ]]           && echo "udpx_junk = ${CONFIG[udpx_junk]}"
+            [[ -n "${CONFIG[udp_rotate]}" ]]          && echo "udp_rotate = ${CONFIG[udp_rotate]}"
+            [[ -n "${CONFIG[udp_rotate_interval]}" ]] && echo "udp_rotate_interval = ${CONFIG[udp_rotate_interval]}"
             echo ""
         fi
         if [[ "$is_ipx" == "true" ]]; then
@@ -628,6 +791,9 @@ generate_toml_config() {
             [[ -n "${CONFIG[ipx_proto58_dst6]}" ]]       && echo "proto58_dst_ipv6 = \"${CONFIG[ipx_proto58_dst6]}\""
             [[ -n "${CONFIG[ipx_proto58_gwmac]}" ]]      && echo "proto58_gw_mac = \"${CONFIG[ipx_proto58_gwmac]}\""
             [[ -n "${CONFIG[ipx_allowed_client_ips]}" ]] && echo "allowed_client_ips = ${CONFIG[ipx_allowed_client_ips]}"
+            # P6a passive in-band DPI/health observer (true|false). Observe-ONLY (no wire bytes) => need NOT
+            # match the peer. Empty => off.
+            [[ -n "${CONFIG[ipx_dpi_observe]}" ]]        && echo "dpi_observe = ${CONFIG[ipx_dpi_observe]}"
             echo ""
         fi
         if [[ "${CONFIG[transport_type]}" =~ mux$ ]]; then
@@ -637,6 +803,9 @@ generate_toml_config() {
             echo "mux_recievebuffer = ${CONFIG[mux_recievebuffer]}"
             echo "mux_streambuffer = ${CONFIG[mux_streambuffer]}"
             [[ -n "${CONFIG[mux_concurrency]}" ]] && echo "mux_concurrency = ${CONFIG[mux_concurrency]}"
+            # Hedioum-port: randomize the per-session smux keepalive interval (removes the fixed
+            # inter-NOP DPI clock; one-sided safe, no wire change). Empty => faithful fixed cadence.
+            [[ -n "${CONFIG[mux_keepalive_jitter]}" ]] && echo "mux_keepalive_jitter = ${CONFIG[mux_keepalive_jitter]}"
             echo ""
         fi
         if [[ "${CONFIG[transport_type]}" == "kcp" ]]; then
@@ -675,7 +844,7 @@ generate_toml_config() {
             echo ""
         fi
         echo "[security]"
-        if [[ "$is_ipx" == "true" ]]; then
+        if [[ "$is_rawl3" == "true" ]]; then
             echo "enable_encryption = ${CONFIG[enable_encryption]}"
             [[ "${CONFIG[enable_encryption]}" == "true" ]] && {
                 echo "algorithm = \"${CONFIG[algorithm]}\""
@@ -698,6 +867,24 @@ generate_toml_config() {
         [[ -n "${CONFIG[pad_frames]}" ]] && echo "pad_frames = ${CONFIG[pad_frames]}"
         [[ -n "${CONFIG[pad_min]}" ]]    && echo "pad_min = ${CONFIG[pad_min]}"
         [[ -n "${CONFIG[pad_max]}" ]]    && echo "pad_max = ${CONFIG[pad_max]}"
+        # P4 AEAD hardening (random-nonce + wall-clock HKDF epoch keys) — closes the restart-nonce-reuse
+        # forgery. Only meaningful when encryption is on, and covers BOTH the raw-L3 and stream [security]
+        # branches. MUST match on BOTH ends (a mismatch fails every GCM auth = silent zero throughput).
+        if [[ "${CONFIG[enable_encryption]}" == "true" ]]; then
+            [[ -n "${CONFIG[aead_harden]}" ]]    && echo "aead_harden = ${CONFIG[aead_harden]}"
+            # v3 aead_dir_keys — derive SEPARATE up/down AEAD keys (requires aead_harden; implicit/forced for
+            # udpx/icmpx). WIRE-CHANGING => MUST match on BOTH ends (a one-sided value is a dead tunnel). Empty => off.
+            [[ -n "${CONFIG[aead_dir_keys]}" ]]  && echo "aead_dir_keys = ${CONFIG[aead_dir_keys]}"
+            [[ -n "${CONFIG[rekey_interval]}" ]] && echo "rekey_interval = ${CONFIG[rekey_interval]}"
+            # P4b anti-replay (true|false). Requires aead_harden; WIRE-SEMANTICS change (+8 ct bytes) → MUST
+            # match on BOTH ends (a one-sided value is a dead tunnel). Empty => off.
+            [[ -n "${CONFIG[anti_replay]}" ]]    && echo "anti_replay = ${CONFIG[anti_replay]}"
+            # P3b size-bucket shaping (true|false; udpx/icmpx only). Requires aead_harden; pads each datagram to
+            # a size bucket INSIDE the AEAD (+2 padlen/pkt) → MUST match on BOTH ends (one-sided = dead tunnel).
+            # size_buckets (CSV of on-wire payload sizes) is self-describing → need NOT match; empty => default.
+            [[ -n "${CONFIG[size_shape]}" ]]     && echo "size_shape = ${CONFIG[size_shape]}"
+            [[ -n "${CONFIG[size_buckets]}" ]]   && echo "size_buckets = \"${CONFIG[size_buckets]}\""
+        fi
         echo ""
         if [[ -n "${CONFIG[tls_sni]}" || -n "${CONFIG[tls_cert]}" || -n "${CONFIG[tls_sni_list]}" ]]; then
             echo "[tls]"
@@ -818,6 +1005,8 @@ prompt_dpi_section() {
     # Stage-4: Noise record padding max (tcp/tcpmux; needs obfuscation=noise). Blank = carrier default 256.
     if [[ "$transport" =~ ^(tcp|tcpmux)$ ]]; then
         prompt_with_default "Noise record padding max bytes (blank = 256; needs obfuscation=noise)" "" CONFIG[obfs_padding]
+        # obfs_fake_tls: frame Noise records as TLS 1.2 app-data records vs a stateless first-byte DPI.
+        prompt_boolean "Fake-TLS record framing (Noise records look like TLS app-data; needs noise; both ends)" "false" CONFIG[obfs_fake_tls]
     fi
     if [[ "$transport" =~ ^(wss|wssmux|anytls)$ ]]; then
         prompt_with_default "SNI rotation list (comma-separated; empty = single SNI)" "" CONFIG[dpi_sni_list_raw]
@@ -837,10 +1026,32 @@ prompt_dpi_section() {
                 prompt_with_default "    ↳ Consecutive probe failures before switching early" "2" CONFIG[adaptive_probe_fails]
             fi
         fi
+        # ENHANCEMENT — health-scored exit steering: probe multiple exits and steer to the best.
+        prompt_boolean "Health-scored failover (steer to the fastest reachable exit; needs 2+ exits)" "false" CONFIG[health_failover]
+        if [[ "${CONFIG[health_failover]}" == "true" ]]; then
+            prompt_with_default "  ↳ Health probe interval seconds (how often to re-rank exits)" "15" CONFIG[health_probe_interval]
+            # ENHANCEMENT — in-band hard-stall/blackhole detector (catches a dead data-plane behind an
+            # exit that still handshakes — invisible to the OOB probe). mux-TCP + encryption + the
+            # common server-[ports] topology; inert otherwise. Does NOT chase bandwidth throttling.
+            prompt_boolean "  ↳ In-band stall/blackhole failover (kernel TCP_INFO; mux-TCP + encryption)" "false" CONFIG[inband_failover]
+        fi
+        # v3: proactive TCP-stream rotation — re-establish a HEALTHY client conn on a jittered timer to dodge
+        # the ~30s volumetric-throttle-to-blackhole (the proactive complement to inband_failover). LOCAL/one-end.
+        if [[ "$transport" =~ ^(tcp|tcpmux|xtcpmux|ws|wss|wsmux|wssmux|xwsmux|anytls|http|https)$ ]]; then
+            prompt_boolean "Proactive TCP rotation (reconnect on a timer; dodges volumetric blackhole)" "false" CONFIG[tcp_rotate]
+            [[ "${CONFIG[tcp_rotate]}" == "true" ]] && prompt_with_default "  ↳ Rotation interval seconds (jittered ±40%; floor 10)" "20" CONFIG[tcp_rotate_interval]
+        fi
     fi
     # --- Dagger-fusion Stage-1 toggles (opt-in; set on BOTH ends where noted) ---
     if [[ "$transport" =~ ^(wss|wssmux|anytls)$ ]]; then
         prompt_boolean "Split ClientHello across TCP segments (anti-SNI-reassembly)" "true" CONFIG[tls_fragment]
+        # Hedioum-port: channel-bind the token to the served TLS leaf cert (token never on the wire;
+        # rejects a TLS-terminating MITM). BOTH ends must match. _fp tolerates an intended terminator.
+        prompt_boolean "Channel-bind token to TLS cert (tls_auth_bind; anti-MITM) [BOTH ends]" "false" CONFIG[tls_auth_bind]
+        [[ "${CONFIG[tls_auth_bind]}" == "true" ]] && prompt_with_default "  ↳ Intended-terminator leaf SHA-256 (64-hex; empty = bind the live leaf)" "" CONFIG[tls_auth_bind_fp]
+        # Hedioum-port: plaintext SMTP/IMAP + STARTTLS prologue before TLS (benign mail identity from
+        # byte 1). BOTH ends must set the SAME value (asymmetric => no tunnel).
+        prompt_with_default "Mail-mimic STARTTLS prologue [empty=off / smtp / imap] [BOTH ends]" "" CONFIG[mail_mimic]
     fi
     # Stage-4: anytls uTLS fingerprint (blank = randomized browser uTLS; "go" = stock crypto/tls).
     if [[ "$transport" == "anytls" ]]; then
@@ -851,6 +1062,20 @@ prompt_dpi_section() {
     fi
     if [[ "$transport" == "kcp" ]]; then
         prompt_boolean "Runtime adaptive tuner (kcp band retune + low-RAM governor)" "true" CONFIG[runtime_tune]
+    fi
+    # Hedioum-port: per-install decoy persona (unique Server/ETag/Last-Modified) for every decoy this
+    # node emits (probe_decoy 200, ws fake-site, http/https mimicry). Server-side; anti-fleet-fingerprint.
+    if [[ "$mode" == "server" && "$transport" =~ ^(ws|wss|wsmux|wssmux|xwsmux|tcp|tcpmux|kcp|http|https)$ ]]; then
+        prompt_boolean "Per-install decoy identity (unique Server/ETag persona; anti-fleet-fingerprint)" "false" CONFIG[decoy_identity]
+    fi
+    # Hedioum-port: per-connection relay traffic shaper (local backpressure on the [ports] side; no
+    # both-ends coordination needed). Only meaningful on the side that carries [ports].
+    prompt_boolean "Relay traffic shaper (per-connection Mbps cap on forwarded traffic)" "false" CONFIG[relay_shape]
+    if [[ "${CONFIG[relay_shape]}" == "true" ]]; then
+        prompt_with_default "  ↳ Base rate Mbps (combined up+down per connection)" "100" CONFIG[relay_base_mbps]
+        prompt_with_default "  ↳ Jitter ± Mbps (0 = fixed cap)" "0" CONFIG[relay_jitter_mbps]
+        prompt_with_default "  ↳ Burst bytes (min 8192; default 4 MiB)" "4194304" CONFIG[relay_burst_bytes]
+        prompt_with_default "  ↳ Re-roll interval seconds" "30" CONFIG[relay_reroll_secs]
     fi
     echo ""
 }
@@ -869,13 +1094,18 @@ gen_noninteractive() {
     # in the TOML — a non-empty remote_addr would make remote_addrs inert (CurrentRemote
     # precedence). BH_REMOTE stays set for port derivation (tun name / unit name).
     CONFIG[remote_addrs]="${BH_REMOTE_ADDRS:+$(csv_to_toml_array "$BH_REMOTE_ADDRS")}"
+    # ENHANCEMENT — [listener].bind_addrs (server multi-bind) + [dialer].local_addr/local_addrs (client
+    # source-address bind). Empty => key omitted. CSV lists become TOML arrays via csv_to_toml_array.
+    CONFIG[bind_addrs]="${BH_BIND_ADDRS:+$(csv_to_toml_array "$BH_BIND_ADDRS")}"
+    CONFIG[local_addr]="${BH_LOCAL_ADDR}"
+    CONFIG[local_addrs]="${BH_LOCAL_ADDRS:+$(csv_to_toml_array "$BH_LOCAL_ADDRS")}"
     CONFIG[edge_ip]="${BH_EDGE_IP}"
     CONFIG[dial_timeout]="${BH_DIAL_TIMEOUT:-10}"
     CONFIG[retry_interval]="${BH_RETRY:-3}"
     # No silent fallback: an empty token would install the well-known default on
     # both ends, which is an open door — fail loudly instead. The ipx raw engine
     # has no token handshake at all (it authenticates with the PSK), so it is exempt.
-    if [[ "${BH_TUN_ENCAP}" == "ipx" ]]; then
+    if [[ "${BH_TUN_ENCAP}" == "ipx" || "${BH_TUN_ENCAP}" == "icmpx" || "${BH_TUN_ENCAP}" == "udpx" ]]; then
         CONFIG[token]="${BH_TOKEN}"
     else
         CONFIG[token]="${BH_TOKEN:?BH_TOKEN is required}"
@@ -927,11 +1157,39 @@ gen_noninteractive() {
     CONFIG[adaptive_failures]="${BH_ADAPTIVE_FAILURES}"; CONFIG[adaptive_carriers]="${BH_ADAPTIVE_CARRIERS:+$(csv_to_toml_array "$BH_ADAPTIVE_CARRIERS")}"
     # ENHANCEMENT — active pre-probe (client-side; empty BH_* => key omitted => reactive-only default)
     CONFIG[adaptive_probe]="${BH_ADAPTIVE_PROBE}"; CONFIG[adaptive_probe_interval]="${BH_ADAPTIVE_PROBE_INTERVAL}"; CONFIG[adaptive_probe_fails]="${BH_ADAPTIVE_PROBE_FAILS}"
+    # ENHANCEMENT — health-scored exit steering (client-side; empty BH_* => key omitted => off)
+    CONFIG[health_failover]="${BH_HEALTH_FAILOVER}"; CONFIG[health_probe_interval]="${BH_HEALTH_PROBE_INTERVAL}"
+    CONFIG[inband_failover]="${BH_INBAND_FAILOVER}" # ENHANCEMENT — in-band throttle/stall failover (client; empty => omitted => off)
     # Dagger-fusion Stage-1 toggles (empty => key omitted => faithful default off)
     CONFIG[tls_fragment]="${BH_TLS_FRAGMENT}"; CONFIG[probe_decoy]="${BH_PROBE_DECOY}"; CONFIG[runtime_tune]="${BH_RUNTIME_TUNE}"
     # Stage-4: obfs_padding (tcp/tcpmux noise padding) + tls_fingerprint (anytls uTLS) — both [transport].
-    CONFIG[obfs_padding]="${BH_OBFS_PADDING}"; CONFIG[tls_fingerprint]="${BH_TLS_FINGERPRINT}"
+    CONFIG[obfs_padding]="${BH_OBFS_PADDING}"; CONFIG[tls_fingerprint]="${BH_TLS_FINGERPRINT}"; CONFIG[obfs_fake_tls]="${BH_OBFS_FAKE_TLS}"
+    # Hedioum-port ENHANCEMENTS (empty BH_* => key omitted => faithful default off)
+    CONFIG[decoy_identity]="${BH_DECOY_IDENTITY}"
+    CONFIG[tls_auth_bind]="${BH_TLS_AUTH_BIND}"; CONFIG[tls_auth_bind_fp]="${BH_TLS_AUTH_BIND_FP}"
+    CONFIG[mail_mimic]="${BH_MAIL_MIMIC}"
+    CONFIG[mux_keepalive_jitter]="${BH_MUX_KA_JITTER}"
+    CONFIG[relay_shape]="${BH_RELAY_SHAPE}"; CONFIG[relay_base_mbps]="${BH_RELAY_BASE}"
+    CONFIG[relay_jitter_mbps]="${BH_RELAY_JITTER}"; CONFIG[relay_burst_bytes]="${BH_RELAY_BURST}"
+    CONFIG[relay_reroll_secs]="${BH_RELAY_REROLL}"
+    # v3 [transport]: rate_mbps carrier egress pacer (all transports, one-end/local); tcp_rotate + interval
+    # (client, tcp-stream). RAW reads — unset => empty => key omitted => byte/timing-identical off.
+    CONFIG[rate_mbps]="${BH_RATE_MBPS}"
+    CONFIG[tcp_rotate]="${BH_TCP_ROTATE}"; CONFIG[tcp_rotate_interval]="${BH_TCP_ROTATE_INTERVAL}"
     CONFIG[pad_frames]="${BH_PAD_FRAMES}"; CONFIG[pad_min]="${BH_PAD_MIN}"; CONFIG[pad_max]="${BH_PAD_MAX}"
+    # P4 AEAD hardening. Default ON for icmpx/udpx (the carriers gated on P4 — the core's ApplyDefaults also
+    # forces it, this keeps the emitted TOML honest); off elsewhere unless BH_AEAD_HARDEN is set. rekey_interval
+    # default 3600s (core clamps 1..86400). Both ends get the same values via --gen → interop.
+    CONFIG[aead_harden]="${BH_AEAD_HARDEN}"; CONFIG[rekey_interval]="${BH_REKEY_INTERVAL}"
+    CONFIG[anti_replay]="${BH_ANTI_REPLAY}" # P4b: opt-in sliding-window anti-replay (requires aead_harden; both ends)
+    CONFIG[aead_dir_keys]="${BH_AEAD_DIR_KEYS}" # v3: separate up/down AEAD keys (requires aead_harden; BOTH ends). RAW read.
+    # P3b size-bucket shaping is a udpx/icmpx-only feature (the core rejects it on ipx); only emit it there.
+    if [[ "${BH_TUN_ENCAP}" == "udpx" || "${BH_TUN_ENCAP}" == "icmpx" ]]; then
+        CONFIG[size_shape]="${BH_SIZE_SHAPE}"; CONFIG[size_buckets]="${BH_SIZE_BUCKETS}"
+    fi
+    if [[ "${BH_TUN_ENCAP}" == "icmpx" || "${BH_TUN_ENCAP}" == "udpx" ]]; then
+        CONFIG[aead_harden]="${BH_AEAD_HARDEN:-true}"; CONFIG[rekey_interval]="${BH_REKEY_INTERVAL:-3600}"
+    fi
     CONFIG[kcp_mode]="${BH_KCP_MODE:-fast2}"; CONFIG[kcp_data_shards]="${BH_KCP_DATA:-10}"
     CONFIG[kcp_parity_shards]="${BH_KCP_PARITY:-3}"; CONFIG[kcp_mtu]="${BH_KCP_MTU:-1350}"
     CONFIG[tun_encapsulation]="${BH_TUN_ENCAP}"
@@ -952,7 +1210,7 @@ gen_noninteractive() {
     CONFIG[tun_outer_auth]="${BH_TUN_AUTH}"
     # the raw engine adds outer headers, so it needs the smaller MTU the
     # interactive path offers (1320 vs 1500) — the panel has one field for both
-    local _def_mtu=1500; [[ "${BH_TUN_ENCAP}" == "ipx" ]] && _def_mtu=1320
+    local _def_mtu=1500; [[ "${BH_TUN_ENCAP}" == "ipx" || "${BH_TUN_ENCAP}" == "icmpx" || "${BH_TUN_ENCAP}" == "udpx" ]] && _def_mtu=1320
     CONFIG[tun_mtu]="${BH_TUN_MTU:-$_def_mtu}"
     CONFIG[ipx_mode]="${BH_IPX_MODE}"; CONFIG[ipx_profile]="${BH_IPX_PROFILE:-tcp}"
     CONFIG[ipx_listen_ip]="${BH_IPX_LISTEN}"; CONFIG[ipx_dst_ip]="${BH_IPX_DST}"
@@ -966,6 +1224,35 @@ gen_noninteractive() {
     CONFIG[ipx_proto58_src6]="${BH_IPX_PROTO58_SRC6}"; CONFIG[ipx_proto58_dst6]="${BH_IPX_PROTO58_DST6}"
     CONFIG[ipx_proto58_gwmac]="${BH_IPX_PROTO58_GWMAC}"
     CONFIG[ipx_allowed_client_ips]="${BH_IPX_ALLOWED:+$(csv_to_toml_array "$BH_IPX_ALLOWED")}"
+    CONFIG[ipx_dpi_observe]="${BH_IPX_DPI_OBSERVE}"
+    # icmpx native kernel-ICMP carrier ([icmpx]) — reuses [tun] + [security]. mode/listen_ip/dst_ip
+    # are required; the rest are optional wire/perf knobs (empty => key omitted => core default). The
+    # wire-changing ones (id/id_pool/id_rotate_sec/mimic_ping) MUST match on both ends — the panel/
+    # caller passes the SAME values to server and client.
+    CONFIG[icmpx_mode]="${BH_ICMPX_MODE}"
+    CONFIG[icmpx_listen_ip]="${BH_ICMPX_LISTEN}"; CONFIG[icmpx_dst_ip]="${BH_ICMPX_DST}"
+    CONFIG[icmpx_id_pool]="${BH_ICMPX_ID_POOL}"; CONFIG[icmpx_id]="${BH_ICMPX_ID}"
+    CONFIG[icmpx_id_rotate_sec]="${BH_ICMPX_ID_ROTATE}"; CONFIG[icmpx_mimic_ping]="${BH_ICMPX_MIMIC}"
+    CONFIG[icmpx_readers]="${BH_ICMPX_READERS}"; CONFIG[icmpx_batch]="${BH_ICMPX_BATCH}"
+    CONFIG[icmpx_suppress]="${BH_ICMPX_SUPPRESS}"; CONFIG[icmpx_kernel_filter]="${BH_ICMPX_KFILTER}"
+    CONFIG[icmpx_dpi_observe]="${BH_ICMPX_DPI_OBSERVE}"
+    CONFIG[icmpx_junk]="${BH_ICMPX_JUNK}" # v3: client/one-end flow-start cover burst. RAW read => empty => omitted => off.
+    # udpx plain-UDP carrier ([udpx]) — reuses [tun] + [security] (encryption MANDATORY, defaulted on
+    # above). mode/listen_ip/dst_ip + a UDP `port` both ends bind & target. port default 40000 (NOT
+    # WireGuard's 51820); written unconditionally so an omitted port can't become a silent :0 bind.
+    CONFIG[udpx_mode]="${BH_UDPX_MODE}"
+    CONFIG[udpx_listen_ip]="${BH_UDPX_LISTEN}"; CONFIG[udpx_dst_ip]="${BH_UDPX_DST}"
+    CONFIG[udpx_port]="${BH_UDPX_PORT:-40000}"
+    CONFIG[udpx_readers]="${BH_UDPX_READERS}"; CONFIG[udpx_batch]="${BH_UDPX_BATCH}"
+    CONFIG[udpx_obfs]="${BH_UDPX_OBFS}"; CONFIG[udpx_gso]="${BH_UDPX_GSO}"
+    CONFIG[udpx_hop_ports]="${BH_UDPX_HOP_PORTS}"; CONFIG[udpx_hop_interval]="${BH_UDPX_HOP_INTERVAL}"
+    CONFIG[udpx_dpi_observe]="${BH_UDPX_DPI_OBSERVE}"
+    # v3: udpx_junk (client flow-start cover datagrams) + udp_rotate/interval (client source-port rotation).
+    # RAW reads => empty => omitted => off. udp_rotate is mutually exclusive with hop_ports — do NOT set it
+    # when BH_UDPX_HOP_PORTS is non-empty (leave it omitted so the core's hop schedule owns the port).
+    CONFIG[udpx_junk]="${BH_UDPX_JUNK}"
+    [[ -z "${BH_UDPX_HOP_PORTS}" ]] && CONFIG[udp_rotate]="${BH_UDP_ROTATE}"
+    CONFIG[udp_rotate_interval]="${BH_UDP_ROTATE_INTERVAL}"
     CONFIG[auto_tuning]="${BH_AUTO_TUNING:-true}"; CONFIG[tuning_profile]="${BH_TUNING_PROFILE:-balanced}"
     CONFIG[workers]="${BH_WORKERS:-0}"
     # a layer-3 device sees far more packets per second than a stream carrier, so
@@ -984,6 +1271,12 @@ gen_noninteractive() {
     # it there); on a stream transport the core's own default applies
     if [[ "${BH_TYPE}" == "tun" ]]; then CONFIG[forwarder]="${BH_FORWARDER:-leech}"; else CONFIG[forwarder]="${BH_FORWARDER}"; fi
     CONFIG[ports_mapping]="${BH_PORTS}"; CONFIG[enable_encryption]="${BH_ENC:-false}"
+    # icmpx: default encryption ON (the carrier's AEAD is its authenticator; unencrypted icmpx is
+    # injectable and offers no confidentiality). Operators can still force it off with BH_ENC=false.
+    [[ "${BH_TUN_ENCAP}" == "icmpx" ]] && CONFIG[enable_encryption]="${BH_ENC:-true}"
+    # udpx encryption is MANDATORY (the AEAD is its only authenticator) — force it on, ignoring any
+    # BH_ENC=false, so the configurator never emits a udpx config that the core rejects at boot.
+    [[ "${BH_TUN_ENCAP}" == "udpx" ]] && CONFIG[enable_encryption]=true
     # The interactive path answers these prompts (and therefore writes them, even at
     # their zero value) under exactly the conditions below. Mirror the same gates, or
     # the two entry points produce configs that differ only on paper — or, worse,
@@ -992,7 +1285,7 @@ gen_noninteractive() {
     [[ "$mode" == "server" && "${BH_TYPE:-tcp}" == "tcp" ]] && CONFIG[accept_udp]="${BH_ACCEPT_UDP:-false}"
     CONFIG[proxy_protocol]="${BH_PROXY_PROTO}"
     [[ "$mode" == "server" && ! "${BH_TYPE:-tcp}" =~ ^(tun|ws)$ && "${BH_TUN_ENCAP}" != "ipx" ]] && CONFIG[proxy_protocol]="${BH_PROXY_PROTO:-false}"
-    if [[ "${BH_TUN_ENCAP}" == "ipx" ]]; then
+    if [[ "${BH_TUN_ENCAP}" == "ipx" || "${BH_TUN_ENCAP}" == "icmpx" || "${BH_TUN_ENCAP}" == "udpx" ]]; then
         CONFIG[tcp_mss]="${BH_TCP_MSS}"; CONFIG[so_rcvbuf]="${BH_SO_RCVBUF}"
         CONFIG[so_sndbuf]="${BH_SO_SNDBUF:-0}"; CONFIG[buffer_profile]="${BH_BUFFER_PROFILE}"
     else
@@ -1037,18 +1330,20 @@ gen_noninteractive() {
     fi
     CONFIG[ring_size]="${BH_RING_SIZE:-64}"; CONFIG[frame_size]="${BH_FRAME_SIZE:-2048}"
     CONFIG[peer_idle_timeout_s]="${BH_PEER_IDLE:-120}"; CONFIG[write_timeout_ms]="${BH_WRITE_TIMEOUT:-3}"
-    local is_tun=false is_ipx=false
+    local is_tun=false is_ipx=false is_icmpx=false is_udpx=false
     [[ "${CONFIG[transport_type]}" == "tun" ]] && is_tun=true
     [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]] && is_ipx=true
-    # The ipx raw-packet engine has no TCP socket, so the interactive path never
-    # asks for (and never emits) these. Blank them here too, or a panel-created ipx
+    [[ "${CONFIG[tun_encapsulation]}" == "icmpx" ]] && is_icmpx=true
+    [[ "${CONFIG[tun_encapsulation]}" == "udpx" ]] && is_udpx=true
+    # The raw-L3 carriers (ipx, icmpx, udpx) have no TCP socket, so the interactive path never
+    # asks for (and never emits) these. Blank them here too, or a panel-created raw-L3
     # tunnel would carry socket knobs the configurator's own output does not have.
-    if [[ "$is_ipx" == "true" ]]; then
+    if [[ "$is_ipx" == "true" || "$is_icmpx" == "true" || "$is_udpx" == "true" ]]; then
         CONFIG[nodelay]=""; CONFIG[keepalive_period]=""
         CONFIG[dial_timeout]=""; CONFIG[retry_interval]=""
         CONFIG[connection_pool]=""; CONFIG[congestion]=""; CONFIG[obfuscation]=""
     fi
-    generate_toml_config "$mode" "$out" "$is_tun" "$is_ipx"
+    generate_toml_config "$mode" "$out" "$is_tun" "$is_ipx" "$is_icmpx" "$is_udpx"
     echo "generated $out (type=${CONFIG[transport_type]} mode=$mode)"
 }
 # The default LEECH license key baked into the configurator + panel. Pressing Enter
@@ -1077,14 +1372,29 @@ configure_server() {
     prompt_transport_section "$mode"
     local is_tun="false"
     local is_ipx="false"
+    local is_icmpx="false"
+    local is_udpx="false"
+    local is_rawl3="false"
     [[ "${CONFIG[transport_type]}" == "tun" ]] && is_tun="true"
     [[ "${CONFIG[tun_encapsulation]}" == "ipx" ]] && is_ipx="true"
-    prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_ipx"
+    [[ "${CONFIG[tun_encapsulation]}" == "icmpx" ]] && is_icmpx="true"
+    [[ "${CONFIG[tun_encapsulation]}" == "udpx" ]] && is_udpx="true"
+    # ipx/icmpx/udpx are the socketless raw-L3 carriers — they share the raw MTU (1320),
+    # no outer_auth, the encryption+PSK security block, and the ipx-style tuning path.
+    case "${CONFIG[tun_encapsulation]}" in
+        ipx|icmpx|udpx) is_rawl3="true" ;;
+    esac
+    prompt_tun_section "${CONFIG[transport_type]}" "$mode" "$is_rawl3"
     prompt_ipx_section "$is_ipx" "$mode"
-    if [[ "$is_ipx" != "true" ]]; then
+    prompt_icmpx_udpx_section "${CONFIG[tun_encapsulation]}" "$mode"
+    if [[ "$is_rawl3" != "true" ]]; then
         prompt_connection_section "$mode"
     fi
-    prompt_security_section "$is_ipx"
+    # icmpx/udpx mandate encryption (unlike ipx, which is opt-in) — the wizard must not offer to
+    # disable it, or the generated config is rejected by the core at Validate.
+    local mandate_enc="false"
+    [[ "$is_icmpx" == "true" || "$is_udpx" == "true" ]] && mandate_enc="true"
+    prompt_security_section "$is_rawl3" "$mandate_enc"
     prompt_accept_udp_section "${CONFIG[accept_udp]}"
     prompt_mux_section "${CONFIG[transport_type]}"
     prompt_tls_section "$mode" "${CONFIG[transport_type]}"
@@ -1092,7 +1402,7 @@ configure_server() {
     prompt_http_section "${CONFIG[transport_type]}"
     prompt_quantum_section "${CONFIG[transport_type]}"
     prompt_dpi_section "$mode" "${CONFIG[transport_type]}"
-    prompt_tuning_section "$is_ipx" "$is_tun"
+    prompt_tuning_section "$is_rawl3" "$is_tun"
     prompt_logging_section
     prompt_ports_section "$mode" "$is_tun"
     local tunnel_port
@@ -1110,7 +1420,7 @@ configure_server() {
     else
         config_file="${config_dir}/kharej${tunnel_port}.toml"
     fi
-    generate_toml_config "$mode" "$config_file" "$is_tun" "$is_ipx"
+    generate_toml_config "$mode" "$config_file" "$is_tun" "$is_ipx" "$is_icmpx" "$is_udpx"
     local service_type
     [[ "$mode" == "server" ]] && service_type="iran" || service_type="kharej"
     create_systemd_service "$service_type" "$tunnel_port" "$config_file"
@@ -1690,7 +2000,7 @@ panel_rm() {
 
 # --list : enumerate local tunnel endpoints.  emits {"tunnels":[...]}
 panel_list() {
-    local first=1 f name typ port active transport token remote
+    local first=1 f name typ port active transport encapsulation token remote
     printf '{"tunnels":['
     for f in "${config_dir}"/{iran,kharej}*.toml; do
         [ -f "$f" ] || continue
@@ -1703,11 +2013,12 @@ panel_list() {
         remote=""; [[ "$typ" == kharej ]] && remote=$(awk -F'"' '/^remote_addr = /{print $2; exit}' "$f" 2>/dev/null)
         systemctl is-active --quiet "leech-${name}" && active=true || active=false
         transport=$(grep -oP 'type\s*=\s*"\K[^"]+' "$f" | head -1)
+        encapsulation=$(grep -oP 'encapsulation\s*=\s*"\K[^"]+' "$f" | head -1)
         token=$(grep -oP 'token\s*=\s*"\K[^"]+' "$f" | head -1)
         remote=$(grep -oP 'remote_addr\s*=\s*"\K[^"]+' "$f" | head -1)
         [ $first -eq 1 ] || printf ','; first=0
-        printf '{"type":"%s","port":%s,"active":%s,"transport":"%s","token":"%s","remote":"%s"}' \
-            "$typ" "$port" "$active" "${transport:-}" "${token:-}" "${remote:-}"
+        printf '{"type":"%s","port":%s,"active":%s,"transport":"%s","encapsulation":"%s","token":"%s","remote":"%s"}' \
+            "$typ" "$port" "$active" "${transport:-}" "${encapsulation:-}" "${token:-}" "${remote:-}"
     done
     printf ']}\n'
 }
@@ -1726,7 +2037,7 @@ panel_stats() {
     [[ -x "${config_dir}/leech" ]] && cver=$("${config_dir}/leech" -v 2>/dev/null | head -1 | tr -d '"\\')
     printf '{"host":{"cpu_total":%s,"cpu_idle":%s,"mem_used":%s,"mem_total":%s,"rx_bytes":%s,"tx_bytes":%s,"uptime":%s,"ncpu":%s,"core":"%s"},"tunnels":[' \
         "${cput:-0}" "${cpui:-0}" "${memu:-0}" "${memt:-0}" "${hrx:-0}" "${htx:-0}" "${upt:-0}" "${ncpu:-1}" "${cver}"
-    local first=1 f name typ port active pid mem cpuns rx tx conns dir transport remote
+    local first=1 f name typ port active pid mem cpuns rx tx conns dir transport encapsulation remote
     for f in "${config_dir}"/{iran,kharej}*.toml; do
         [ -f "$f" ] || continue
         name=$(basename "$f" .toml)
@@ -1735,6 +2046,8 @@ panel_stats() {
         # transport + (client's) remote let the panel auto-discover tunnels across nodes
         # and detect a re-tunnel to a different server made outside the panel.
         transport=$(awk -F'"' '/^type = /{print $2; exit}' "$f" 2>/dev/null)
+        # [tun].encapsulation (tcp/ipx/icmpx/udpx) so the panel can label the actual L3 carrier.
+        encapsulation=$(awk -F'"' '/^encapsulation = /{print $2; exit}' "$f" 2>/dev/null)
         remote=""; [[ "$typ" == kharej ]] && remote=$(awk -F'"' '/^remote_addr = /{print $2; exit}' "$f" 2>/dev/null)
         systemctl is-active --quiet "leech-${name}" && active=true || active=false
         mem=$(systemctl show "leech-${name}" -p MemoryCurrent --value 2>/dev/null)
@@ -1815,8 +2128,8 @@ panel_stats() {
             fi
         fi
         [ $first -eq 1 ] || printf ','; first=0
-        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s,"transport":"%s","remote":"%s","restarts":%s,"up_secs":%s,"hflaps":%s,"hage":%s}' \
-            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}" "${transport}" "${remote}" "${nrestarts}" "${up_secs}" "${hflaps:-0}" "${hage:-0}"
+        printf '{"type":"%s","port":%s,"active":%s,"cpu_ns":%s,"mem":%s,"rx_bytes":%s,"tx_bytes":%s,"conns":%s,"transport":"%s","encapsulation":"%s","remote":"%s","restarts":%s,"up_secs":%s,"hflaps":%s,"hage":%s}' \
+            "$typ" "$port" "$active" "$cpuns" "$mem" "${rx:-0}" "${tx:-0}" "${conns:-0}" "${transport}" "${encapsulation}" "${remote}" "${nrestarts}" "${up_secs}" "${hflaps:-0}" "${hage:-0}"
     done
     printf ']}\n'
 }
